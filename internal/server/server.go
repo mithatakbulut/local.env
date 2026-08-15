@@ -137,6 +137,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /setup", s.setup)
+	mux.HandleFunc("GET /assets/{path...}", s.dashboardAsset)
 	mux.HandleFunc("GET /login", s.dashboardLogin)
 	mux.HandleFunc("GET /repos", s.dashboardRepositories)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.dashboardRepository)
@@ -551,7 +552,7 @@ func (s *Server) githubReady(ctx context.Context) error {
 }
 
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
-	page := setupPage{DisplayName: s.config.DisplayName}
+	page := setupPage{DisplayName: dashboardDisplayName(s.config.DisplayName)}
 	if !s.config.GitHubSetupConfigured() {
 		page.ConfigurationRequired = true
 		s.renderSetup(w, http.StatusServiceUnavailable, page)
@@ -1549,6 +1550,10 @@ func (s setupSession) organization(rawID string) (githubapp.Organization, bool) 
 
 type setupPage struct {
 	DisplayName           string
+	FaviconURL            string
+	Bootstrap             string
+	Stylesheet            string
+	Script                string
 	ConfigurationRequired bool
 	Complete              bool
 	SignInURL             string
@@ -1556,19 +1561,50 @@ type setupPage struct {
 	Organizations         []githubapp.Organization
 	AppURL                string
 	Repositories          []githubapp.Repository
+	ManifestAction        string
+	Manifest              string
 }
 
-var setupTemplate = template.Must(template.New("setup").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{{.DisplayName}} setup</title></head><body><main><h1>{{.DisplayName}} setup</h1>{{if .ConfigurationRequired}}<p>GitHub setup requires the bootstrap OAuth client and credential-encryption key configured by the instance administrator.</p>{{else if .Complete}}<p>GitHub App setup is complete. Install the App into the repositories you want local.env to discover.</p>{{if .AppURL}}<p><a href="{{.AppURL}}">Install GitHub App</a></p>{{end}}{{if .Repositories}}<h2>Discovered repositories</h2><ul>{{range .Repositories}}<li>{{.Owner}}/{{.Name}}</li>{{end}}</ul>{{end}}{{else if .SignInURL}}<p><a href="{{.SignInURL}}">Sign in with GitHub to select an organization</a></p>{{else}}<p>Select the organization that will own this GitHub App.</p><form method="post" action="/setup/github-app"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><label>Organization <select name="organization_id" required>{{range .Organizations}}<option value="{{.ID}}">{{.Login}}</option>{{end}}</select></label><button type="submit">Create GitHub App</button></form>{{end}}</main></body></html>`))
-var manifestPostTemplate = template.Must(template.New("manifest").Parse(`<!doctype html><html lang="en"><body><main><p>Continue to GitHub to create your App.</p><form method="post" action="{{.Action}}"><input type="hidden" name="manifest" value="{{.Manifest}}"><button type="submit">Continue to GitHub</button></form></main></body></html>`))
+var setupTemplate = template.Must(template.New("setup").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.DisplayName}} setup</title>
+  {{if .FaviconURL}}<link rel="icon" href="{{.FaviconURL}}">{{end}}
+  <link rel="stylesheet" href="/assets/{{.Stylesheet}}">
+</head>
+<body>
+  <div id="dashboard-shell" data-dashboard="{{.Bootstrap}}"></div>
+  <main id="dashboard-content" tabindex="-1"><div id="dashboard-page"></div>{{if .ManifestAction}}<noscript><h1>Create your GitHub App</h1><p>Continue to GitHub to create the organization-owned App.</p><form method="post" action="{{.ManifestAction}}"><input type="hidden" name="manifest" value="{{.Manifest}}"><button type="submit">Continue to GitHub</button></form></noscript>{{end}}</main>
+  <script type="module" src="/assets/{{.Script}}"></script>
+</body>
+</html>`))
 
 func (s *Server) renderSetup(w http.ResponseWriter, status int, page setupPage) {
+	assets, err := dashboardShellAssets()
+	if err != nil {
+		http.Error(w, "dashboard assets are unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	logoURL := brandingURLString(s.config.LogoURL)
+	view := dashboardViewForSetup(page)
+	bootstrap, err := json.Marshal(dashboardBootstrap{DisplayName: page.DisplayName, LogoURL: logoURL, Path: "/setup", Title: "Set up", View: view})
+	if err != nil {
+		http.Error(w, "dashboard metadata is unavailable", http.StatusInternalServerError)
+		return
+	}
+	page.FaviconURL = brandingURLString(s.config.FaviconURL)
+	page.Bootstrap = string(bootstrap)
+	page.Stylesheet = assets.Stylesheet
+	page.Script = assets.Script
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_ = setupTemplate.Execute(w, page)
 }
 func (s *Server) renderManifestPost(w http.ResponseWriter, action, manifest string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = manifestPostTemplate.Execute(w, struct{ Action, Manifest string }{action, manifest})
+	displayName := dashboardDisplayName(s.config.DisplayName)
+	s.renderSetup(w, http.StatusOK, setupPage{DisplayName: displayName, ManifestAction: action, Manifest: manifest})
 }
 func installationURL(htmlURL string) string {
 	if htmlURL == "" {

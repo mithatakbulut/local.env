@@ -24,6 +24,23 @@ func TestLoadFromEnvRejectsUnsafeURL(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvRequiresHTTPSBrandingURLs(t *testing.T) {
+	t.Setenv("LOCALENV_PUBLIC_URL", "http://127.0.0.1:8080")
+	t.Setenv("LOCALENV_LOGO_URL", "http://assets.example.test/logo.svg")
+	if _, err := LoadFromEnv(); err == nil {
+		t.Fatal("LoadFromEnv() accepted an insecure logo URL")
+	}
+	t.Setenv("LOCALENV_LOGO_URL", "https://assets.example.test/logo.svg")
+	t.Setenv("LOCALENV_FAVICON_URL", "https://assets.example.test/favicon.ico")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv() HTTPS branding: %v", err)
+	}
+	if cfg.LogoURL == nil || cfg.FaviconURL == nil {
+		t.Fatalf("branding URLs were not retained: %#v", cfg)
+	}
+}
+
 func TestLoadFromEnvValidatesGitHubSetupSecretsAsASet(t *testing.T) {
 	t.Setenv("LOCALENV_PUBLIC_URL", "https://env.example.test")
 	t.Setenv("LOCALENV_GITHUB_OAUTH_CLIENT_ID", "bootstrap-client")

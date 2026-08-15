@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --background: 0 0% 100%;
+  --foreground: 0 0% 9%;
+  --border: 0 0% 85%;
+  --muted: 0 0% 96%;
+  --muted-foreground: 0 0% 40%;
+  --success: 142 71% 35%;
+  --warning: 24 95% 40%;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+html { background: hsl(var(--background)); }
+body { margin: 0; min-width: 320px; background: hsl(var(--background)); color: hsl(var(--foreground)); }
+
+#dashboard-content {
+  box-sizing: border-box;
+  width: min(100% - 2rem, 62rem);
+  margin: 5.5rem auto 3rem;
+  line-height: 1.55;
+}
+
+#dashboard-content h1 { margin: 0 0 1.5rem; font-size: clamp(1.75rem, 4vw, 2.25rem); letter-spacing: -0.04em; }
+#dashboard-content h2 { margin: 2rem 0 0.75rem; font-size: 1rem; }
+#dashboard-content p { color: hsl(var(--muted-foreground)); }
+#dashboard-content a { color: hsl(var(--foreground)); font-weight: 600; text-underline-offset: 3px; }
+#dashboard-content ul { display: grid; gap: 0.65rem; padding: 0; list-style: none; }
+#dashboard-content li, #dashboard-content > p { border: 1px solid hsl(var(--border)); border-radius: 0.75rem; padding: 1rem; background: hsl(var(--background)); }
+#dashboard-content table { width: 100%; border-collapse: collapse; overflow: hidden; border: 1px solid hsl(var(--border)); border-radius: 0.75rem; }
+#dashboard-content th, #dashboard-content td { padding: 0.75rem 1rem; border-bottom: 1px solid hsl(var(--border)); text-align: left; }
+#dashboard-content th { background: hsl(var(--muted)); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+#dashboard-content code { border-radius: 0.25rem; background: hsl(var(--muted)); padding: 0.15rem 0.35rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+
+body.dashboard-ui #dashboard-content { margin-top: 6.5rem; }
+@media (min-width: 768px) { body.dashboard-ui #dashboard-content { margin-left: calc(16rem + max(2rem, (100vw - 78rem) / 2)); margin-right: 2rem; } }
+@media (max-width: 640px) { #dashboard-content { width: min(100% - 1.5rem, 62rem); } #dashboard-content table { display: block; overflow-x: auto; white-space: nowrap; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after { transition-duration: 0.01ms !important; }
+}
