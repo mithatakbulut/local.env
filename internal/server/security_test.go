@@ -178,7 +178,7 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 		}
 	}
 	cookieResponse := httptest.NewRecorder()
-	if !app.writeCookie(cookieResponse, dashboardCookie, dashboardSession{User: githubapp.User{ID: 11, Login: "admin"}, OrganizationID: 7, ExpiresAt: time.Now().UTC().Add(time.Hour)}, time.Hour) {
+	if !app.writeCookie(cookieResponse, dashboardCookie, dashboardSession{User: githubapp.User{ID: 11, Login: "admin"}, OrganizationID: 7, CSRFToken: "non-secret-dashboard-csrf", ExpiresAt: time.Now().UTC().Add(time.Hour)}, time.Hour) {
 		t.Fatal("write dashboard cookie")
 	}
 	cookie := cookieNamed(t, cookieResponse.Result().Cookies(), dashboardCookie)
@@ -202,7 +202,7 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 			t.Fatal(err)
 		}
 		pageBody := html.UnescapeString(string(body))
-		if page.Code != http.StatusOK || !strings.Contains(pageBody, pageCase.kind) || strings.Contains(pageBody, browserSentinel) || strings.Contains(pageBody, "ciphertext") || strings.Contains(pageBody, "wrapped_rek") || strings.Contains(pageBody, "secret_value") {
+		if page.Code != http.StatusOK || page.Header().Get("Cache-Control") != "no-store" || !strings.Contains(pageBody, pageCase.kind) || !strings.Contains(pageBody, `"csrf_token":"non-secret-dashboard-csrf"`) || strings.Contains(pageBody, browserSentinel) || strings.Contains(pageBody, "ciphertext") || strings.Contains(pageBody, "wrapped_rek") || strings.Contains(pageBody, "secret_value") {
 			t.Fatalf("dashboard page %q = %d %q", pageCase.path, page.Code, body)
 		}
 	}
@@ -237,6 +237,66 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 	app.Handler().ServeHTTP(blocked, wrongOrigin)
 	if blocked.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin mutation = %d", blocked.Code)
+	}
+}
+
+func TestDashboardLogoutClearsTheLocalSessionAndRequiresCSRF(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.ConfigureGitHubInstance(context.Background(), 7, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	app := New(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store)
+	cookieResponse := httptest.NewRecorder()
+	if !app.writeCookie(cookieResponse, dashboardCookie, dashboardSession{User: githubapp.User{ID: 11, Login: "member"}, OrganizationID: 7, CSRFToken: "non-secret-dashboard-csrf", ExpiresAt: time.Now().UTC().Add(time.Hour)}, time.Hour) {
+		t.Fatal("write dashboard cookie")
+	}
+	cookie := cookieNamed(t, cookieResponse.Result().Cookies(), dashboardCookie)
+
+	missingCSRF := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	missingCSRF.AddCookie(cookie)
+	missingCSRFResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(missingCSRFResponse, missingCSRF)
+	if missingCSRFResponse.Code != http.StatusForbidden {
+		t.Fatalf("logout without CSRF = %d, want 403", missingCSRFResponse.Code)
+	}
+
+	wrongOrigin := httptest.NewRequest(http.MethodPost, "/logout", strings.NewReader("csrf_token=non-secret-dashboard-csrf"))
+	wrongOrigin.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	wrongOrigin.Header.Set("Origin", "https://other.example.test")
+	wrongOrigin.AddCookie(cookie)
+	wrongOriginResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(wrongOriginResponse, wrongOrigin)
+	if wrongOriginResponse.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin logout = %d, want 403", wrongOriginResponse.Code)
+	}
+
+	logout := httptest.NewRequest(http.MethodPost, "/logout", strings.NewReader("csrf_token=non-secret-dashboard-csrf"))
+	logout.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	logout.AddCookie(cookie)
+	logoutResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(logoutResponse, logout)
+	if logoutResponse.Code != http.StatusSeeOther || logoutResponse.Header().Get("Location") != "/login?logged_out=1" {
+		t.Fatalf("dashboard logout = %d %q", logoutResponse.Code, logoutResponse.Header().Get("Location"))
+	}
+	cleared := strings.Join(logoutResponse.Header().Values("Set-Cookie"), "\n")
+	if !strings.Contains(cleared, "localenv_dashboard=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax") {
+		t.Fatalf("dashboard cookie was not safely cleared: %q", cleared)
+	}
+
+	signedOut := httptest.NewRecorder()
+	app.Handler().ServeHTTP(signedOut, httptest.NewRequest(http.MethodGet, "/login?logged_out=1", nil))
+	if signedOut.Code != http.StatusOK || !strings.Contains(html.UnescapeString(signedOut.Body.String()), `"kind":"signed_out"`) || strings.Contains(signedOut.Body.String(), "non-secret-dashboard-csrf") {
+		t.Fatalf("signed-out page = %d %q", signedOut.Code, signedOut.Body.String())
+	}
+
+	unauthenticated := httptest.NewRecorder()
+	app.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/repos", nil))
+	if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login" {
+		t.Fatalf("dashboard after logout = %d %q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
 	}
 }
 
