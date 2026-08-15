@@ -48,6 +48,8 @@ func (e *HTTPError) StatusClass() string {
 		return e.ResponseClass
 	}
 	switch e.StatusCode {
+	case http.StatusFound:
+		return "requester_not_organization_member"
 	case http.StatusUnauthorized:
 		return "unauthenticated"
 	case http.StatusForbidden:
@@ -198,7 +200,7 @@ func (c Client) ActiveOrganizationMembership(ctx context.Context, token, organiz
 	case http.StatusNoContent:
 		return true, nil
 	case http.StatusNotFound, http.StatusFound:
-		return false, nil
+		return false, &HTTPError{Operation: "organization_membership", StatusCode: response.StatusCode}
 	default:
 		return false, &HTTPError{Operation: "organization_membership", StatusCode: response.StatusCode, PermissionRequirement: safeAcceptedPermissions(response.Header.Get("X-Accepted-GitHub-Permissions")), ResponseClass: safeResponseClass(response.StatusCode, response.Header)}
 	}

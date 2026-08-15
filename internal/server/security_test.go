@@ -181,3 +181,48 @@ func TestDashboardLoginUsesActiveOrganizationMembership(t *testing.T) {
 		t.Fatal("dashboard callback did not create a dashboard session")
 	}
 }
+
+func TestDashboardLoginLogsSafeOrganizationMembershipRedirect(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.ConfigureGitHubInstance(context.Background(), 7, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	const oauthToken = "oauth-token-must-not-be-logged"
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
+			_, _ = w.Write([]byte(`{"access_token":"` + oauthToken + `"}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"id":11,"login":"member"}`))
+		case "/orgs/acme/members/member":
+			w.Header().Set("Location", "https://github.com/orgs/acme")
+			w.WriteHeader(http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(github.Close)
+	var logs bytes.Buffer
+	app := NewWithGitHubClientAndLogger(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), GitHubOAuthClientID: "client", GitHubOAuthClientSecret: "non-secret-test", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: github.Client(), APIBaseURL: github.URL, OAuthURL: github.URL + "/login/oauth"}, slog.New(slog.NewTextHandler(&logs, nil)))
+	start := httptest.NewRecorder()
+	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/login", nil))
+	location, err := url.Parse(start.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=code&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	callback.AddCookie(cookieNamed(t, start.Result().Cookies(), oauthStateCookie))
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, callback)
+	if response.Code != http.StatusForbidden || strings.Contains(response.Body.String(), oauthToken) {
+		t.Fatalf("dashboard callback = %d %q", response.Code, response.Body.String())
+	}
+	output := logs.String()
+	if !strings.Contains(output, "github_operation=organization_membership") || !strings.Contains(output, "github_status=302") || !strings.Contains(output, "github_status_class=requester_not_organization_member") || strings.Contains(output, oauthToken) || strings.Contains(output, "https://github.com/orgs/acme") {
+		t.Fatalf("membership diagnostic log = %q", output)
+	}
+}

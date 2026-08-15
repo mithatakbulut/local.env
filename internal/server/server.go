@@ -656,6 +656,12 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		active, membershipErr := s.github.ActiveOrganizationMembership(ctx, token, organization.Login, user.Login)
 		if membershipErr != nil {
+			var githubError *githubapp.HTTPError
+			if errors.As(membershipErr, &githubError) && (githubError.StatusCode == http.StatusFound || githubError.StatusCode == http.StatusNotFound) {
+				s.logGitHubMembershipFailure(membershipErr)
+				http.Error(w, "GitHub account "+user.Login+" does not have an active membership in the configured organization", http.StatusForbidden)
+				return
+			}
 			http.Error(w, "GitHub organization membership verification failed", http.StatusBadGateway)
 			return
 		}
@@ -1314,6 +1320,18 @@ func (s *Server) logGitHubPublicationFailure(err error) {
 		return
 	}
 	s.logger.Warn("GitHub readiness publication failed", "github_status_class", "transport_or_response")
+}
+
+// logGitHubMembershipFailure deliberately records only fixed diagnostic
+// metadata. In particular, it never records OAuth credentials, redirect
+// locations, request headers, or GitHub response bodies.
+func (s *Server) logGitHubMembershipFailure(err error) {
+	var githubError *githubapp.HTTPError
+	if errors.As(err, &githubError) {
+		s.logger.Warn("GitHub organization membership verification denied", "github_operation", githubError.Operation, "github_status", githubError.StatusCode, "github_status_class", githubError.StatusClass())
+		return
+	}
+	s.logger.Warn("GitHub organization membership verification failed", "github_status_class", "transport_or_response")
 }
 
 func readinessText(requirements []pranalysis.Requirement, detailsURL string) (summary, comment string, success bool) {

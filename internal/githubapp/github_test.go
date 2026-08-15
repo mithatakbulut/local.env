@@ -81,7 +81,11 @@ func TestActiveOrganizationMembershipDoesNotFollowRedirect(t *testing.T) {
 	t.Cleanup(github.Close)
 
 	active, err := (Client{HTTPClient: github.Client(), APIBaseURL: github.URL}).ActiveOrganizationMembership(context.Background(), "non-secret-test-token", "acme", "member")
-	if err != nil || active || redirected {
+	var githubError *HTTPError
+	if !errors.As(err, &githubError) || active || redirected {
 		t.Fatalf("ActiveOrganizationMembership() = (%t, %v), redirected=%t", active, err, redirected)
+	}
+	if githubError.Operation != "organization_membership" || githubError.StatusCode != http.StatusFound || githubError.StatusClass() != "requester_not_organization_member" {
+		t.Fatalf("membership HTTPError = %#v, class = %q", githubError, githubError.StatusClass())
 	}
 }
