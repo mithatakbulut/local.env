@@ -4,3 +4,8 @@
 *.db-wal
 *.pem
 docs/
+!docs/
+docs/*
+!docs/cli.md
+!docs/installation.md
+!docs/security-model.md

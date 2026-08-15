@@ -37,7 +37,7 @@ func main() {
 	}
 	defer store.Close()
 
-	app := server.New(cfg, store)
+	app := server.NewWithLogger(cfg, store, logger)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           app.Handler(),

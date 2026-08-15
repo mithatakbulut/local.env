@@ -16,7 +16,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24.x"
+      - run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./cmd/localenv ./cmd/localenv-server
       - run: docker build --file deploy/docker/Dockerfile --tag localenv:test .
+      - uses: golang/govulncheck-action@v1
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: localenv:test
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL

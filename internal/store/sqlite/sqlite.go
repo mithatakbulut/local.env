@@ -293,6 +293,9 @@ func (s *Store) RegisterDevice(ctx context.Context, token, id, name, recipient, 
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET device_id = ?, last_seen_at = ? WHERE token_hash = ?`, device.ID, now, tokenHash(token)); err != nil {
 		return Device{}, fmt.Errorf("associate session device: %w", err)
 	}
+	if err := insertAuditEvent(ctx, tx, userID, device.ID, "", "device.registered", map[string]string{"device_id": device.ID}); err != nil {
+		return Device{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Device{}, fmt.Errorf("commit device registration: %w", err)
 	}
@@ -941,6 +944,9 @@ func (s *Store) SaveRepositoryConfigSnapshot(ctx context.Context, snapshot Repos
 			return fmt.Errorf("store repository file configuration: %w", err)
 		}
 	}
+	if err := insertAuditEvent(ctx, tx, 0, "", repositoryID, "repo.enabled", map[string]string{"owner": snapshot.Owner, "name": snapshot.Name}); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit repository configuration snapshot: %w", err)
 	}
@@ -1008,6 +1014,9 @@ func (s *Store) SavePullRequestRequirements(ctx context.Context, pull githubapp.
 	result.Requirements = append([]pranalysis.Requirement(nil), requirements...)
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(github_check_run_id, 0), COALESCE(github_comment_id, 0) FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, pull.Number).Scan(&result.CheckRunID, &result.CommentID); err != nil {
 		return PullRequestReadiness{}, fmt.Errorf("read PR publication identifiers: %w", err)
+	}
+	if err := insertAuditEvent(ctx, tx, 0, "", repositoryID, "pr.requirements_changed", map[string]string{"pull_request": strconv.Itoa(pull.Number)}); err != nil {
+		return PullRequestReadiness{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return PullRequestReadiness{}, fmt.Errorf("commit PR requirements: %w", err)
@@ -1087,6 +1096,13 @@ func (s *Store) ClosePullRequest(ctx context.Context, pull githubapp.PullRequest
 		if _, err := tx.ExecContext(ctx, `UPDATE secret_versions SET archived_at = ? WHERE repository_id = ? AND scope = 'pull_request' AND scope_id = ? AND archived_at IS NULL`, now, repositoryID, strconv.Itoa(pull.Number)); err != nil {
 			return fmt.Errorf("archive pending secrets: %w", err)
 		}
+	}
+	eventType := "secret.archived"
+	if pull.State == "merged" {
+		eventType = "secret.promoted_from_pr"
+	}
+	if err := insertAuditEvent(ctx, tx, 0, "", repositoryID, eventType, map[string]string{"pull_request": strconv.Itoa(pull.Number)}); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
 		return fmt.Errorf("advance repository revision: %w", err)
@@ -1323,6 +1339,13 @@ func (s *Store) UpdateBaselineSecret(ctx context.Context, owner, name string, gi
 	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
 		return fmt.Errorf("advance repository revision: %w", err)
 	}
+	eventType := "secret.updated"
+	if current == 0 {
+		eventType = "secret.created"
+	}
+	if err := insertAuditEvent(ctx, tx, githubUserID, deviceID, repositoryID, eventType, map[string]string{"file_id": fileID, "key_name": keyName, "scope": "baseline", "version": strconv.FormatInt(envelope.Version, 10)}); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit encrypted baseline secret: %w", err)
 	}
@@ -1395,6 +1418,13 @@ func (s *Store) UpdatePullRequestSecret(ctx context.Context, owner, name string,
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
 		return PullRequestReadiness{}, fmt.Errorf("advance repository revision: %w", err)
+	}
+	eventType := "secret.updated"
+	if current == 0 {
+		eventType = "secret.created"
+	}
+	if err := insertAuditEvent(ctx, tx, githubUserID, deviceID, repositoryID, eventType, map[string]string{"file_id": fileID, "key_name": keyName, "scope": "pull_request", "scope_id": strconv.Itoa(number), "version": strconv.FormatInt(envelope.Version, 10)}); err != nil {
+		return PullRequestReadiness{}, err
 	}
 	result := PullRequestReadiness{PullRequest: pull}
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(github_check_run_id, 0), COALESCE(github_comment_id, 0) FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, number).Scan(&result.CheckRunID, &result.CommentID); err != nil {

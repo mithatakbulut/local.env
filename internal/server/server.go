@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -94,6 +95,8 @@ type Server struct {
 	store       readinessStore
 	credentials *githubapp.CredentialStore
 	github      githubapp.Client
+	logger      *slog.Logger
+	limiter     *requestLimiter
 }
 
 // New constructs a server using GitHub's public endpoints.
@@ -101,9 +104,24 @@ func New(config config.Config, store readinessStore) *Server {
 	return NewWithGitHubClient(config, store, githubapp.DefaultClient())
 }
 
+// NewWithLogger constructs the production server with one shared structured
+// logger for lifecycle and request events.
+func NewWithLogger(config config.Config, store readinessStore, logger *slog.Logger) *Server {
+	return NewWithGitHubClientAndLogger(config, store, githubapp.DefaultClient(), logger)
+}
+
 // NewWithGitHubClient exists to keep external GitHub exchanges testable.
 func NewWithGitHubClient(config config.Config, store readinessStore, client githubapp.Client) *Server {
-	return &Server{config: config, store: store, credentials: githubapp.NewCredentialStore(config.DataDir, config.GitHubAppCredentialsEncryptionKey), github: client}
+	return NewWithGitHubClientAndLogger(config, store, client, defaultLogger())
+}
+
+// NewWithGitHubClientAndLogger permits production to supply its structured
+// logger and tests to capture only safe request metadata.
+func NewWithGitHubClientAndLogger(config config.Config, store readinessStore, client githubapp.Client, logger *slog.Logger) *Server {
+	if logger == nil {
+		logger = defaultLogger()
+	}
+	return &Server{config: config, store: store, credentials: githubapp.NewCredentialStore(config.DataDir, config.GitHubAppCredentialsEncryptionKey), github: client, logger: logger, limiter: newRequestLimiter()}
 }
 
 // Handler returns the public HTTP routes available through P1.
@@ -112,6 +130,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /setup", s.setup)
+	mux.HandleFunc("GET /login", s.dashboardLogin)
+	mux.HandleFunc("GET /repos", s.dashboardRepositories)
+	mux.HandleFunc("GET /repos/{owner}/{repo}", s.dashboardRepository)
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", s.dashboardPullRequest)
+	mux.HandleFunc("GET /devices", s.dashboardDevices)
+	mux.HandleFunc("GET /audit", s.dashboardAudit)
+	mux.HandleFunc("GET /settings", s.dashboardSettings)
 	mux.HandleFunc("POST /setup/github-app", s.createGitHubApp)
 	mux.HandleFunc("GET /setup/github-app/callback", s.githubAppCallback)
 	mux.HandleFunc("GET /auth/github/start", s.githubAuthStart)
@@ -139,7 +164,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/pulls/{number}/requirements", s.pullRequirements)
 	mux.HandleFunc("PUT /api/v1/repos/{owner}/{repo}/pulls/{number}/secrets/{fileID}/{keyName}", s.updatePullRequestSecret)
 	mux.HandleFunc("POST /api/v1/github/webhook", s.githubWebhook)
-	return mux
+	return s.withSecurity(mux)
 }
 
 // rotateRepositoryKey accepts only a complete client-side re-encryption of
@@ -589,6 +614,26 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 	csrf, err := randomToken()
 	if err != nil {
 		http.Error(w, "could not complete GitHub sign-in", http.StatusInternalServerError)
+		return
+	}
+	if state.Audience == "dashboard" {
+		store, available := s.store.(dashboardStore)
+		if !available {
+			http.Error(w, "dashboard is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		organizationID, orgErr := store.DashboardOrganizationID(ctx)
+		if orgErr != nil || !memberOfOrganization(organizations, organizationID) {
+			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
+			return
+		}
+		session := dashboardSession{User: user, OrganizationID: organizationID, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
+		if !s.writeCookie(w, dashboardCookie, session, 8*time.Hour) {
+			http.Error(w, "could not complete dashboard sign-in", http.StatusInternalServerError)
+			return
+		}
+		s.clearCookie(w, oauthStateCookie)
+		http.Redirect(w, r, "/repos", http.StatusFound)
 		return
 	}
 	session := setupSession{User: user, Organizations: organizations, CSRFToken: csrf, ExpiresAt: time.Now().UTC().Add(15 * time.Minute)}
@@ -1287,7 +1332,17 @@ func randomToken() (string, error) {
 
 type oauthState struct {
 	State     string    `json:"state"`
+	Audience  string    `json:"audience,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func memberOfOrganization(organizations []githubapp.Organization, wanted int64) bool {
+	for _, organization := range organizations {
+		if organization.ID == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (s oauthState) Expired() bool { return time.Now().UTC().After(s.ExpiresAt) }

@@ -6,6 +6,11 @@ Your code changed. Your local env should too.
 development environment variables synchronized with its codebase. It is not a
 production, staging, CI, or general-purpose secret manager.
 
+See the [installation guide](docs/installation.md), [CLI reference](docs/cli.md),
+and [security model](docs/security-model.md). The server-rendered dashboard at
+`/login` is metadata-only: it shows repository readiness, public device
+identity, and audit events, but never accepts or displays a secret value.
+
 ## Development server
 
 The server provides a persistent SQLite database, health endpoints, and the
@@ -138,6 +143,13 @@ go vet ./...
 go test ./...
 go build ./cmd/localenv ./cmd/localenv-server
 ```
+
+## Release verification
+
+Tagged releases publish checksums, a Sigstore bundle, an SPDX SBOM, and the
+container image digest. Verify a downloaded artifact with the release checksum
+and its `cosign` bundle before deployment. CI also runs formatting, tests,
+`go vet`, Go vulnerability scanning, and a high/critical container scan.
 
 ## CLI runtime mode
 
