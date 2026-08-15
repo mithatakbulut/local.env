@@ -1,0 +1,15 @@
+services:
+  localenv:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      LOCALENV_PUBLIC_URL: ${LOCALENV_PUBLIC_URL:?set LOCALENV_PUBLIC_URL to this instance's public HTTP(S) URL}
+    volumes:
+      - localenv-data:/data
+    restart: unless-stopped
+
+volumes:
+  localenv-data:
