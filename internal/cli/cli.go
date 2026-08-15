@@ -858,17 +858,22 @@ func runResolve(args []string, out, errOut io.Writer) int {
 	}
 	defer clear(rek)
 	missing := 0
+	readinessPending := false
 	for _, requirement := range response.Requirements {
 		if requirement.State != "missing" {
 			continue
 		}
 		missing++
-		if !setEncryptedPRValue(out, errOut, instance, token, owner, name, *pr, response.Repository, rek, requirement, nil) {
+		published, ok := setEncryptedPRValue(out, errOut, instance, token, owner, name, *pr, response.Repository, rek, requirement, nil)
+		if !ok {
 			return 1
 		}
+		readinessPending = readinessPending || !published
 	}
 	if missing == 0 {
 		fmt.Fprintln(out, "All PR local environment requirements are already resolved.")
+	} else if readinessPending {
+		fmt.Fprintf(out, "Encrypted and uploaded %d PR value(s). GitHub readiness publication is pending.\n", missing)
 	} else {
 		fmt.Fprintf(out, "Encrypted and uploaded %d PR value(s). GitHub readiness was refreshed.\n", missing)
 	}
@@ -933,10 +938,15 @@ func runSet(args []string, out, errOut io.Writer) int {
 				return 1
 			}
 			defer clear(value)
-			if !setEncryptedPRValue(out, errOut, instance, token, owner, name, *pr, response.Repository, rek, requirement, value) {
+			published, ok := setEncryptedPRValue(out, errOut, instance, token, owner, name, *pr, response.Repository, rek, requirement, value)
+			if !ok {
 				return 1
 			}
-			fmt.Fprintln(out, "Encrypted locally, uploaded, and refreshed GitHub readiness.")
+			if published {
+				fmt.Fprintln(out, "Encrypted locally, uploaded, and refreshed GitHub readiness.")
+			} else {
+				fmt.Fprintln(out, "Encrypted locally and uploaded. GitHub readiness publication is pending.")
+			}
 			return 0
 		}
 	}
@@ -946,37 +956,81 @@ func runSet(args []string, out, errOut io.Writer) int {
 
 func hiddenValue(out io.Writer) ([]byte, error) {
 	fmt.Fprint(out, "Value: ")
-	value, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(out)
-	return value, err
+	state, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	defer term.Restore(int(os.Stdin.Fd()), state)
+	return maskedValue(os.Stdin, out)
 }
 
-func setEncryptedPRValue(out, errOut io.Writer, instance, token, owner, name string, pr int, state apiRepositoryCryptoState, rek []byte, requirement apiPullRequirement, supplied []byte) bool {
+// maskedValue accepts a terminal value without echoing its contents while
+// showing one asterisk per typed byte. The asterisks deliberately reveal only
+// input length, never plaintext bytes.
+func maskedValue(input io.Reader, out io.Writer) ([]byte, error) {
+	value := make([]byte, 0, 64)
+	var byteBuffer [1]byte
+	for {
+		n, err := input.Read(byteBuffer[:])
+		if n > 0 {
+			switch byteBuffer[0] {
+			case '\r', '\n':
+				fmt.Fprintln(out)
+				return value, nil
+			case 3, 4:
+				fmt.Fprintln(out)
+				clear(value)
+				return nil, errors.New("secret input interrupted")
+			case '\b', 127:
+				if len(value) > 0 {
+					value = value[:len(value)-1]
+					fmt.Fprint(out, "\b \b")
+				}
+			default:
+				if len(value) >= 1<<20 {
+					clear(value)
+					return nil, errors.New("secret input is too large")
+				}
+				value = append(value, byteBuffer[0])
+				fmt.Fprint(out, "*")
+			}
+		}
+		if err != nil {
+			clear(value)
+			return nil, err
+		}
+	}
+}
+
+func setEncryptedPRValue(out, errOut io.Writer, instance, token, owner, name string, pr int, state apiRepositoryCryptoState, rek []byte, requirement apiPullRequirement, supplied []byte) (bool, bool) {
 	value := supplied
 	if value == nil {
 		var err error
 		value, err = hiddenValue(out)
 		if err != nil {
 			fmt.Fprintln(errOut, "localenv: could not read a secret value")
-			return false
+			return false, false
 		}
 		defer clear(value)
 	}
 	envelope, err := cryptokit.Encrypt(rek, value, cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: state.GitHubRepoID, FilePath: requirement.FilePath, KeyName: requirement.KeyName, Scope: "pull_request", ScopeID: fmt.Sprintf("%d", pr), Version: requirement.CurrentVersion + 1, KeyEpoch: state.ActiveKeyEpoch})
 	if err != nil {
 		fmt.Fprintln(errOut, "localenv: could not encrypt the secret")
-		return false
+		return false, false
 	}
 	payload := struct {
 		ExpectedCurrentVersion int64              `json:"expected_current_version"`
 		Envelope               cryptokit.Envelope `json:"envelope"`
 	}{requirement.CurrentVersion, envelope}
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/secrets/%s/%s", instance, url.PathEscape(owner), url.PathEscape(name), pr, url.PathEscape(requirement.FileID), url.PathEscape(requirement.KeyName))
-	if err := requestJSON(context.Background(), http.MethodPut, endpoint, token, payload, nil); err != nil {
-		fmt.Fprintln(errOut, "localenv: encrypted secret update was rejected or conflicted")
-		return false
+	var result struct {
+		Readiness string `json:"readiness"`
 	}
-	return true
+	if err := requestJSON(context.Background(), http.MethodPut, endpoint, token, payload, &result); err != nil {
+		fmt.Fprintln(errOut, "localenv: encrypted secret update was rejected or conflicted")
+		return false, false
+	}
+	return result.Readiness != "pending", true
 }
 
 func runLogin(args []string, out, errOut io.Writer) int {

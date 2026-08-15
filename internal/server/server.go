@@ -480,24 +480,37 @@ func (s *Server) updatePullRequestSecret(w http.ResponseWriter, r *http.Request)
 	}
 	credentials, configured, credentialErr := s.credentials.Load()
 	if credentialErr != nil || !configured {
-		http.Error(w, "readiness refresh is unavailable", http.StatusServiceUnavailable)
+		writeJSON(w, http.StatusAccepted, struct {
+			State     string `json:"state"`
+			Readiness string `json:"readiness"`
+		}{State: "stored", Readiness: "pending"})
 		return
 	}
 	summary, comment, success := readinessText(readiness.Requirements, s.publicURL(fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(state.Owner), url.PathEscape(state.Name), number)))
 	publication, err := s.github.PublishReadiness(r.Context(), credentials, state.InstallationID, readiness.PullRequest, githubapp.ReadinessPublication{CheckRunID: readiness.CheckRunID, CommentID: readiness.CommentID, Success: success, Summary: summary, Comment: comment})
 	if err != nil {
-		http.Error(w, "encrypted secret was stored but readiness refresh failed", http.StatusBadGateway)
+		if publications, ok := s.store.(readinessPRStore); ok && (publication.CheckRunID > 0 || publication.CommentID > 0) {
+			_ = publications.SaveReadinessPublication(r.Context(), state.GitHubRepoID, number, publication.CheckRunID, publication.CommentID)
+		}
+		writeJSON(w, http.StatusAccepted, struct {
+			State     string `json:"state"`
+			Readiness string `json:"readiness"`
+		}{State: "stored", Readiness: "pending"})
 		return
 	}
 	if publications, ok := s.store.(readinessPRStore); ok {
 		if err := publications.SaveReadinessPublication(r.Context(), state.GitHubRepoID, number, publication.CheckRunID, publication.CommentID); err != nil {
-			http.Error(w, "readiness publication could not be recorded", http.StatusInternalServerError)
+			writeJSON(w, http.StatusAccepted, struct {
+				State     string `json:"state"`
+				Readiness string `json:"readiness"`
+			}{State: "stored", Readiness: "pending"})
 			return
 		}
 	}
 	writeJSON(w, http.StatusOK, struct {
-		State string `json:"state"`
-	}{State: "ready"})
+		State     string `json:"state"`
+		Readiness string `json:"readiness"`
+	}{State: "ready", Readiness: "published"})
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {

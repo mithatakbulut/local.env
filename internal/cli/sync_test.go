@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,6 +208,44 @@ func TestNormalizeImportArgsAcceptsDocumentedFileFirstSyntax(t *testing.T) {
 	want := []string{"--instance", "https://env.example.test", "--repo", "acme/api", ".env.local"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized arguments = %#v, want %#v", got, want)
+	}
+}
+
+func TestMaskedValueShowsOnlyAsterisksAndHandlesBackspace(t *testing.T) {
+	var output bytes.Buffer
+	value, err := maskedValue(strings.NewReader("value\bX\n"), &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(value), "valuX"; got != want {
+		t.Fatalf("masked value = %q, want %q", got, want)
+	}
+	if got, want := output.String(), "*****\b \b*\n"; got != want || strings.Contains(got, "value") {
+		t.Fatalf("masked output = %q, want only %q", got, want)
+	}
+}
+
+func TestSetEncryptedPRValueAcceptsPendingReadinessPublication(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || !strings.Contains(r.URL.Path, "/pulls/7/secrets/file-id/REDIS_URL") {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "non-secret-pending-value") {
+			t.Fatalf("secret value was sent as plaintext: %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"state":"stored","readiness":"pending"}`))
+	}))
+	t.Cleanup(server.Close)
+	var out, errOut bytes.Buffer
+	published, ok := setEncryptedPRValue(&out, &errOut, server.URL, "test-token", "acme", "api", 7, apiRepositoryCryptoState{InstanceID: "instance", GitHubRepoID: 17, ActiveKeyEpoch: 1}, bytes.Repeat([]byte{'k'}, 32), apiPullRequirement{FileID: "file-id", FilePath: ".env.local", KeyName: "REDIS_URL"}, []byte("non-secret-pending-value"))
+	if !ok || published || errOut.Len() != 0 {
+		t.Fatalf("pending update = published:%t ok:%t out:%q err:%q", published, ok, out.String(), errOut.String())
 	}
 }
 
