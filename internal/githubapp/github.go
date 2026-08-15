@@ -20,12 +20,51 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const maxGitHubResponseBytes = 1 << 20
+
+// HTTPError preserves only safe GitHub response metadata. It intentionally
+// excludes response bodies, request payloads, and authentication material.
+type HTTPError struct {
+	Operation             string
+	StatusCode            int
+	PermissionRequirement string
+	GrantedPermissions    string
+	ResponseClass         string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("GitHub %s returned status %d", e.Operation, e.StatusCode)
+}
+
+// StatusClass gives operators a stable, non-sensitive diagnostic category.
+func (e *HTTPError) StatusClass() string {
+	if e.ResponseClass != "" {
+		return e.ResponseClass
+	}
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		return "unauthenticated"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusUnprocessableEntity:
+		return "rejected"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	default:
+		if e.StatusCode >= http.StatusInternalServerError {
+			return "upstream_failure"
+		}
+		return "unexpected_status"
+	}
+}
 
 // Client implements only the unauthenticated manifest and OAuth requests P1
 // needs. Its errors intentionally never include tokens, private keys, or bodies.
@@ -197,7 +236,7 @@ func (c Client) ReadFile(ctx context.Context, credentials Credentials, installat
 	if err != nil {
 		return nil, err
 	}
-	response, err := c.authorized(request, token)
+	response, err := c.authorized(request, token.value)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +281,7 @@ func (c Client) HasRepositoryWriteAccess(ctx context.Context, credentials Creden
 	if err != nil {
 		return false, err
 	}
-	response, err := c.authorized(request, token)
+	response, err := c.authorized(request, token.value)
 	if err != nil {
 		return false, err
 	}
@@ -278,7 +317,7 @@ func (c Client) OpenPullRequestNumber(ctx context.Context, credentials Credentia
 	if err != nil {
 		return 0, err
 	}
-	response, err := c.authorized(request, token)
+	response, err := c.authorized(request, token.value)
 	if err != nil {
 		return 0, err
 	}
@@ -345,7 +384,8 @@ func (c Client) PublishReadiness(ctx context.Context, credentials Credentials, i
 	var check struct {
 		ID int64 `json:"id"`
 	}
-	if err := c.authorizedJSON(ctx, token, method, c.apiURL(checkPath...), checkPayload, &check, http.StatusCreated, http.StatusOK); err != nil {
+	if err := c.authorizedJSON(ctx, token.value, method, c.apiURL(checkPath...), checkPayload, &check, "check_run", http.StatusCreated, http.StatusOK); err != nil {
+		setGrantedPermissions(err, token.permissions)
 		return publication, err
 	}
 	if check.ID <= 0 {
@@ -363,7 +403,8 @@ func (c Client) PublishReadiness(ctx context.Context, credentials Credentials, i
 	var comment struct {
 		ID int64 `json:"id"`
 	}
-	if err := c.authorizedJSON(ctx, token, method, c.apiURL(commentPath...), commentPayload, &comment, http.StatusCreated, http.StatusOK); err != nil {
+	if err := c.authorizedJSON(ctx, token.value, method, c.apiURL(commentPath...), commentPayload, &comment, "issue_comment", http.StatusCreated, http.StatusOK); err != nil {
+		setGrantedPermissions(err, token.permissions)
 		return publication, err
 	}
 	if comment.ID <= 0 {
@@ -373,33 +414,39 @@ func (c Client) PublishReadiness(ctx context.Context, credentials Credentials, i
 	return publication, nil
 }
 
-func (c Client) installationToken(ctx context.Context, credentials Credentials, installationID int64) (string, error) {
+type installationToken struct {
+	value       string
+	permissions string
+}
+
+func (c Client) installationToken(ctx context.Context, credentials Credentials, installationID int64) (installationToken, error) {
 	jwt, err := appJWT(credentials)
 	if err != nil {
-		return "", err
+		return installationToken{}, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL("app", "installations", strconv.FormatInt(installationID, 10), "access_tokens"), nil)
 	if err != nil {
-		return "", err
+		return installationToken{}, err
 	}
 	response, err := c.authorized(request, jwt)
 	if err != nil {
-		return "", err
+		return installationToken{}, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("GitHub installation token request returned status %d", response.StatusCode)
+		return installationToken{}, fmt.Errorf("GitHub installation token request returned status %d", response.StatusCode)
 	}
 	var result struct {
-		Token string `json:"token"`
+		Token       string            `json:"token"`
+		Permissions map[string]string `json:"permissions"`
 	}
 	if err := decodeJSON(response.Body, &result); err != nil || result.Token == "" {
-		return "", errors.New("decode GitHub installation token")
+		return installationToken{}, errors.New("decode GitHub installation token")
 	}
-	return result.Token, nil
+	return installationToken{value: result.Token, permissions: safeGrantedPermissions(result.Permissions)}, nil
 }
 
-func (c Client) authorizedJSON(ctx context.Context, token, method, endpoint string, input, output any, statuses ...int) error {
+func (c Client) authorizedJSON(ctx context.Context, token, method, endpoint string, input, output any, operation string, statuses ...int) error {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return err
@@ -422,7 +469,68 @@ func (c Client) authorizedJSON(ctx context.Context, token, method, endpoint stri
 			return nil
 		}
 	}
-	return fmt.Errorf("GitHub write request returned status %d", response.StatusCode)
+	return &HTTPError{Operation: operation, StatusCode: response.StatusCode, PermissionRequirement: safeAcceptedPermissions(response.Header.Get("X-Accepted-GitHub-Permissions")), ResponseClass: safeResponseClass(response.StatusCode, response.Header)}
+}
+
+// safeAcceptedPermissions retains only a known permission-name/read-or-write
+// pair from GitHub's diagnostic response header. It deliberately drops all
+// other header data.
+func safeAcceptedPermissions(value string) string {
+	allowed := map[string]bool{
+		"checks":        true,
+		"contents":      true,
+		"issues":        true,
+		"metadata":      true,
+		"pull_requests": true,
+	}
+	values := make([]string, 0)
+	for _, field := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+		name, level, ok := strings.Cut(field, "=")
+		if ok && allowed[name] && (level == "read" || level == "write") {
+			values = append(values, name+"_"+level)
+		}
+	}
+	return strings.Join(values, "+")
+}
+
+// safeResponseClass records only a standard GitHub response category; it
+// never retains a response body or arbitrary response-header content.
+func safeResponseClass(status int, headers http.Header) string {
+	if status != http.StatusForbidden {
+		return ""
+	}
+	if headers.Get("Retry-After") != "" || headers.Get("X-RateLimit-Remaining") == "0" {
+		return "rate_limited"
+	}
+	if strings.HasPrefix(headers.Get("X-GitHub-SSO"), "required;") {
+		return "sso_authorization_required"
+	}
+	return ""
+}
+
+func safeGrantedPermissions(permissions map[string]string) string {
+	allowed := map[string]bool{
+		"checks":        true,
+		"contents":      true,
+		"issues":        true,
+		"metadata":      true,
+		"pull_requests": true,
+	}
+	values := make([]string, 0, len(permissions))
+	for name, level := range permissions {
+		if allowed[name] && (level == "read" || level == "write") {
+			values = append(values, name+"_"+level)
+		}
+	}
+	sort.Strings(values)
+	return strings.Join(values, "+")
+}
+
+func setGrantedPermissions(err error, permissions string) {
+	var githubError *HTTPError
+	if permissions != "" && errors.As(err, &githubError) {
+		githubError.GrantedPermissions = permissions
+	}
 }
 
 func (c Client) authorized(request *http.Request, token string) (*http.Response, error) {

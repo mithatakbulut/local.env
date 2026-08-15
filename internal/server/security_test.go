@@ -46,6 +46,15 @@ func TestSecurityMiddlewareSetsHeadersRedactsRequestDataAndLimitsAuthentication(
 	}
 }
 
+func TestGitHubPublicationFailureLogsOnlySafeStatusMetadata(t *testing.T) {
+	var logs bytes.Buffer
+	app := NewWithGitHubClientAndLogger(config.Config{}, testStore{}, githubapp.DefaultClient(), slog.New(slog.NewTextHandler(&logs, nil)))
+	app.logGitHubPublicationFailure(&githubapp.HTTPError{Operation: "issue_comment", StatusCode: http.StatusForbidden, PermissionRequirement: "issues_write", GrantedPermissions: "issues_write"})
+	if output := logs.String(); !strings.Contains(output, "github_operation=issue_comment") || !strings.Contains(output, "github_status=403") || !strings.Contains(output, "github_status_class=forbidden") || !strings.Contains(output, "github_permission_requirement=issues_write") || !strings.Contains(output, "github_granted_permissions=issues_write") || strings.Contains(output, "error=") {
+		t.Fatalf("GitHub failure log = %q", output)
+	}
+}
+
 func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), t.TempDir())
 	if err != nil {

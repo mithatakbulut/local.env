@@ -489,6 +489,7 @@ func (s *Server) updatePullRequestSecret(w http.ResponseWriter, r *http.Request)
 	summary, comment, success := readinessText(readiness.Requirements, s.publicURL(fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(state.Owner), url.PathEscape(state.Name), number)))
 	publication, err := s.github.PublishReadiness(r.Context(), credentials, state.InstallationID, readiness.PullRequest, githubapp.ReadinessPublication{CheckRunID: readiness.CheckRunID, CommentID: readiness.CommentID, Success: success, Summary: summary, Comment: comment})
 	if err != nil {
+		s.logGitHubPublicationFailure(err)
 		if publications, ok := s.store.(readinessPRStore); ok && (publication.CheckRunID > 0 || publication.CommentID > 0) {
 			_ = publications.SaveReadinessPublication(r.Context(), state.GitHubRepoID, number, publication.CheckRunID, publication.CommentID)
 		}
@@ -1275,12 +1276,29 @@ func (s *Server) processPullRequest(ctx context.Context, credentials githubapp.C
 	summary, comment, success := readinessText(result.Requirements, s.publicURL(fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(pull.Repository.Owner), url.PathEscape(pull.Repository.Name), pull.Number)))
 	publication, err := s.github.PublishReadiness(ctx, credentials, event.InstallationID, pull, githubapp.ReadinessPublication{CheckRunID: readiness.CheckRunID, CommentID: readiness.CommentID, Success: success, Summary: summary, Comment: comment})
 	if err != nil {
+		s.logGitHubPublicationFailure(err)
 		if publication.CheckRunID > 0 || publication.CommentID > 0 {
 			_ = store.SaveReadinessPublication(ctx, pull.Repository.GitHubRepoID, pull.Number, publication.CheckRunID, publication.CommentID)
 		}
 		return err
 	}
 	return store.SaveReadinessPublication(ctx, pull.Repository.GitHubRepoID, pull.Number, publication.CheckRunID, publication.CommentID)
+}
+
+func (s *Server) logGitHubPublicationFailure(err error) {
+	var githubError *githubapp.HTTPError
+	if errors.As(err, &githubError) {
+		attributes := []any{"github_operation", githubError.Operation, "github_status", githubError.StatusCode, "github_status_class", githubError.StatusClass()}
+		if githubError.PermissionRequirement != "" {
+			attributes = append(attributes, "github_permission_requirement", githubError.PermissionRequirement)
+		}
+		if githubError.GrantedPermissions != "" {
+			attributes = append(attributes, "github_granted_permissions", githubError.GrantedPermissions)
+		}
+		s.logger.Warn("GitHub readiness publication failed", attributes...)
+		return
+	}
+	s.logger.Warn("GitHub readiness publication failed", "github_status_class", "transport_or_response")
 }
 
 func readinessText(requirements []pranalysis.Requirement, detailsURL string) (summary, comment string, success bool) {
