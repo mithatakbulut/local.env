@@ -23,3 +23,16 @@ func TestLoadFromEnvRejectsUnsafeURL(t *testing.T) {
 		t.Fatal("LoadFromEnv() succeeded with URL credentials")
 	}
 }
+
+func TestLoadFromEnvValidatesGitHubSetupSecretsAsASet(t *testing.T) {
+	t.Setenv("LOCALENV_PUBLIC_URL", "https://env.example.test")
+	t.Setenv("LOCALENV_GITHUB_OAUTH_CLIENT_ID", "bootstrap-client")
+	if _, err := LoadFromEnv(); err == nil {
+		t.Fatal("LoadFromEnv() succeeded with incomplete GitHub OAuth configuration")
+	}
+	t.Setenv("LOCALENV_GITHUB_OAUTH_CLIENT_SECRET", "non-secret-test-client-secret")
+	t.Setenv("LOCALENV_GITHUB_APP_CREDENTIALS_ENCRYPTION_KEY", "not-base64")
+	if _, err := LoadFromEnv(); err == nil {
+		t.Fatal("LoadFromEnv() succeeded with invalid GitHub credential encryption key")
+	}
+}

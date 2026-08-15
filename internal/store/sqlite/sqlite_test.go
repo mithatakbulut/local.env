@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/localenv/localenv/migrations"
 )
 
 func TestOpenAppliesMigrationsWALAndPermissions(t *testing.T) {
@@ -40,8 +42,8 @@ func TestOpenAppliesMigrationsWALAndPermissions(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil && err != sql.ErrNoRows {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Errorf("migration count = %d, want 1", count)
+	if count != len(migrations.Names) {
+		t.Errorf("migration count = %d, want %d", count, len(migrations.Names))
 	}
 }
 

@@ -2,17 +2,37 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/localenv/localenv/internal/config"
+	"github.com/localenv/localenv/internal/githubapp"
+	"github.com/localenv/localenv/internal/store/sqlite"
 )
 
 type testStore struct{ err error }
 
 func (s testStore) Ready(context.Context) error { return s.err }
+
+type webhookTestStore struct {
+	testStore
+	calls int
+}
+
+func (s *webhookTestStore) ProcessGitHubWebhook(_ context.Context, event githubapp.WebhookEvent) (bool, error) {
+	s.calls++
+	if event.EventType != "pull_request" || event.DeliveryID != "delivery-1" {
+		return false, errors.New("unexpected webhook event")
+	}
+	return false, nil
+}
 
 func TestOperationalEndpoints(t *testing.T) {
 	app := New(config.Config{}, testStore{})
@@ -32,4 +52,161 @@ func TestReadyzFailsWhenStoreIsUnavailable(t *testing.T) {
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Errorf("GET /readyz status = %d, want 503", recorder.Code)
 	}
+}
+
+func TestGitHubWebhookVerifiesSignatureBeforeProcessing(t *testing.T) {
+	dataDir := t.TempDir()
+	appKey := strings.Repeat("a", 32)
+	store := &webhookTestStore{}
+	app := New(config.Config{DataDir: dataDir, GitHubAppCredentialsEncryptionKey: []byte(appKey)}, store)
+	if err := app.credentials.Save(githubapp.Credentials{AppID: 1, ClientID: "test-client", ClientSecret: "test-client-secret", PrivateKeyPEM: "test-private-key", WebhookSecret: "test-webhook-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"action":"opened","installation":{"id":7,"account":{"id":2,"login":"acme"}}}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/github/webhook", strings.NewReader(string(payload)))
+	request.Header.Set("X-GitHub-Event", "pull_request")
+	request.Header.Set("X-GitHub-Delivery", "delivery-1")
+	request.Header.Set("X-Hub-Signature-256", webhookSignature("test-webhook-secret", payload))
+	recorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("verified webhook status = %d, want 202", recorder.Code)
+	}
+	if store.calls != 1 {
+		t.Errorf("processed webhooks = %d, want 1", store.calls)
+	}
+
+	invalid := httptest.NewRequest(http.MethodPost, "/api/v1/github/webhook", strings.NewReader(`not json`))
+	invalid.Header.Set("X-GitHub-Event", "pull_request")
+	invalid.Header.Set("X-GitHub-Delivery", "delivery-2")
+	invalid.Header.Set("X-Hub-Signature-256", "sha256=00")
+	invalidRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(invalidRecorder, invalid)
+	if invalidRecorder.Code != http.StatusUnauthorized {
+		t.Errorf("unverified webhook status = %d, want 401", invalidRecorder.Code)
+	}
+	if store.calls != 1 {
+		t.Errorf("unverified webhook was processed")
+	}
+}
+
+func TestSetupFlowStoresOnlyEncryptedGitHubCredentialsAndBecomesReady(t *testing.T) {
+	gitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"test-access-token"}`))
+		case "/user":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"login":"admin"}`))
+		case "/user/orgs":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":2,"login":"acme"}]`))
+		case "/app-manifests/manifest-code/conversions":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":9,"pem":"non-secret-test-private-key","webhook_secret":"non-secret-test-webhook-secret","client_id":"manifest-client","client_secret":"non-secret-test-client-secret","html_url":"https://github.com/apps/acme-localenv"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(gitHub.Close)
+
+	dataDir := t.TempDir()
+	store, err := sqlite.Open(context.Background(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	app := NewWithGitHubClient(config.Config{
+		DataDir:                           dataDir,
+		PublicURL:                         mustURL(t, "https://env.example.test"),
+		DisplayName:                       "local.env",
+		GitHubOAuthClientID:               "bootstrap-client",
+		GitHubOAuthClientSecret:           "non-secret-test-bootstrap-client-secret",
+		GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32)),
+	}, store, githubapp.Client{HTTPClient: gitHub.Client(), APIBaseURL: gitHub.URL, OAuthURL: gitHub.URL + "/login/oauth"})
+
+	start := httptest.NewRecorder()
+	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/auth/github/start", nil))
+	if start.Code != http.StatusFound {
+		t.Fatalf("auth start status = %d, want 302", start.Code)
+	}
+	location, err := url.Parse(start.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authCallback := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=oauth-code&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	authCallback.AddCookie(cookieNamed(t, start.Result().Cookies(), oauthStateCookie))
+	auth := httptest.NewRecorder()
+	app.Handler().ServeHTTP(auth, authCallback)
+	if auth.Code != http.StatusFound {
+		t.Fatalf("auth callback status = %d, want 302", auth.Code)
+	}
+	setupSessionCookie := cookieNamed(t, auth.Result().Cookies(), setupCookie)
+	setupRequest := httptest.NewRequest(http.MethodGet, "/setup", nil)
+	setupRequest.AddCookie(setupSessionCookie)
+	session, found := app.readSetupSession(setupRequest)
+	if !found {
+		t.Fatal("setup session was not stored in an encrypted cookie")
+	}
+	form := url.Values{"csrf_token": {session.CSRFToken}, "organization_id": {"2"}}
+	createRequest := httptest.NewRequest(http.MethodPost, "/setup/github-app", strings.NewReader(form.Encode()))
+	createRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	createRequest.Header.Set("Origin", "https://env.example.test")
+	createRequest.AddCookie(setupSessionCookie)
+	create := httptest.NewRecorder()
+	app.Handler().ServeHTTP(create, createRequest)
+	if create.Code != http.StatusOK || !strings.Contains(create.Body.String(), `name="manifest"`) {
+		t.Fatalf("create manifest status/body = %d/%q", create.Code, create.Body.String())
+	}
+	manifestCookie := cookieNamed(t, create.Result().Cookies(), setupCookie)
+	manifestRequest := httptest.NewRequest(http.MethodGet, "/setup", nil)
+	manifestRequest.AddCookie(manifestCookie)
+	manifestSession, found := app.readSetupSession(manifestRequest)
+	if !found || manifestSession.ManifestState == "" {
+		t.Fatal("manifest state was not persisted")
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/setup/github-app/callback?code=manifest-code&state="+url.QueryEscape(manifestSession.ManifestState), nil)
+	callback.AddCookie(manifestCookie)
+	complete := httptest.NewRecorder()
+	app.Handler().ServeHTTP(complete, callback)
+	if complete.Code != http.StatusFound {
+		t.Fatalf("manifest callback status = %d, want 302", complete.Code)
+	}
+	credentials, found, err := app.credentials.Load()
+	if err != nil || !found || credentials.AppID != 9 {
+		t.Fatalf("stored credentials = (%#v, %v, %v), want app 9", credentials, found, err)
+	}
+	ready := httptest.NewRecorder()
+	app.Handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusOK {
+		t.Errorf("readyz after GitHub setup = %d, want 200", ready.Code)
+	}
+}
+
+func cookieNamed(t *testing.T, cookies []*http.Cookie, name string) *http.Cookie {
+	t.Helper()
+	for _, cookie := range cookies {
+		if cookie.Name == name && cookie.Value != "" {
+			return cookie
+		}
+	}
+	t.Fatalf("cookie %q was not set", name)
+	return nil
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+func webhookSignature(secret string, payload []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }

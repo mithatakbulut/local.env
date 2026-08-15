@@ -6,10 +6,10 @@ Your code changed. Your local env should too.
 development environment variables synchronized with its codebase. It is not a
 production, staging, CI, or general-purpose secret manager.
 
-## P0 development server
+## Development server
 
-The initial operational foundation provides the server process, a persistent
-SQLite database, and health endpoints. GitHub App setup arrives in P1.
+The server provides a persistent SQLite database, health endpoints, and the
+GitHub App setup flow.
 
 ```bash
 LOCALENV_PUBLIC_URL=http://localhost:8080 \
@@ -24,7 +24,7 @@ curl --fail http://localhost:8080/readyz
 ```
 
 `LOCALENV_PUBLIC_URL` is required and must be an absolute HTTP(S) URL. The
-server accepts the following optional non-secret settings:
+server accepts the following non-secret settings:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -34,9 +34,38 @@ server accepts the following optional non-secret settings:
 | `LOCALENV_LOGO_URL` | unset | Future dashboard branding |
 | `LOCALENV_FAVICON_URL` | unset | Future dashboard branding |
 
+## GitHub App setup (P1)
+
+Before a new instance can complete `/setup`, its administrator must register a
+small, company-owned bootstrap GitHub OAuth App. Configure its callback URL as:
+
+```text
+https://your-localenv-domain/auth/github/callback
+```
+
+The OAuth App is used only to identify the setup administrator and list their
+organizations (`read:org`). The setup wizard then creates the separate,
+company-owned GitHub App that receives repository webhooks.
+
+Set these deployment secrets outside the repository and persistent `/data`
+volume:
+
+| Variable | Purpose |
+| --- | --- |
+| `LOCALENV_GITHUB_OAUTH_CLIENT_ID` | Bootstrap OAuth App client ID |
+| `LOCALENV_GITHUB_OAUTH_CLIENT_SECRET` | Bootstrap OAuth App client secret |
+| `LOCALENV_GITHUB_APP_CREDENTIALS_ENCRYPTION_KEY` | Base64-encoded, random 32-byte key for encrypting GitHub App credentials at rest |
+
+The setup wizard is intentionally unavailable until all three are present.
+After they are configured, visit `/setup`, sign in with GitHub, select the
+organization, create the App, and install it into the repositories to
+discover. The generated App requests only Contents/Pull requests read,
+Checks/Issues write, and Metadata read; it never requests source-code write,
+Actions, Administration, or Secrets permissions.
+
 `/healthz` confirms that the process is alive. `/readyz` confirms SQLite is
-readable and every compiled migration is applied. The GitHub App configuration
-readiness condition is introduced together with the setup flow in P1.
+readable, every compiled migration is applied, and the encrypted GitHub App
+credentials and instance setup are present.
 
 ## Container
 

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,15 +15,18 @@ const (
 	defaultName       = "local.env"
 )
 
-// Config contains only non-secret server configuration. GitHub credentials are
-// intentionally introduced with the setup flow in P1.
+// Config contains server configuration. Bootstrap OAuth and encryption values
+// are secrets; callers must never log this structure.
 type Config struct {
-	DataDir     string
-	ListenAddr  string
-	PublicURL   *url.URL
-	DisplayName string
-	LogoURL     *url.URL
-	FaviconURL  *url.URL
+	DataDir                           string
+	ListenAddr                        string
+	PublicURL                         *url.URL
+	DisplayName                       string
+	LogoURL                           *url.URL
+	FaviconURL                        *url.URL
+	GitHubOAuthClientID               string
+	GitHubOAuthClientSecret           string
+	GitHubAppCredentialsEncryptionKey []byte
 }
 
 // LoadFromEnv loads and validates server configuration without logging values.
@@ -52,7 +56,25 @@ func LoadFromEnv() (Config, error) {
 	if cfg.FaviconURL, err = parseHTTPURL("LOCALENV_FAVICON_URL", os.Getenv("LOCALENV_FAVICON_URL"), false); err != nil {
 		return Config{}, err
 	}
+	cfg.GitHubOAuthClientID = strings.TrimSpace(os.Getenv("LOCALENV_GITHUB_OAUTH_CLIENT_ID"))
+	cfg.GitHubOAuthClientSecret = strings.TrimSpace(os.Getenv("LOCALENV_GITHUB_OAUTH_CLIENT_SECRET"))
+	if (cfg.GitHubOAuthClientID == "") != (cfg.GitHubOAuthClientSecret == "") {
+		return Config{}, fmt.Errorf("LOCALENV_GITHUB_OAUTH_CLIENT_ID and LOCALENV_GITHUB_OAUTH_CLIENT_SECRET must be set together")
+	}
+	if rawKey := strings.TrimSpace(os.Getenv("LOCALENV_GITHUB_APP_CREDENTIALS_ENCRYPTION_KEY")); rawKey != "" {
+		key, err := base64.StdEncoding.DecodeString(rawKey)
+		if err != nil || len(key) != 32 {
+			return Config{}, fmt.Errorf("LOCALENV_GITHUB_APP_CREDENTIALS_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+		}
+		cfg.GitHubAppCredentialsEncryptionKey = key
+	}
 	return cfg, nil
+}
+
+// GitHubSetupConfigured reports whether this deployment can safely complete
+// the first-run GitHub setup flow.
+func (c Config) GitHubSetupConfigured() bool {
+	return c.GitHubOAuthClientID != "" && c.GitHubOAuthClientSecret != "" && len(c.GitHubAppCredentialsEncryptionKey) == 32
 }
 
 func valueOr(name, fallback string) string {
