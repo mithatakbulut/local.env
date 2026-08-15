@@ -3,6 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net/http"
@@ -103,7 +107,7 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 	}
 }
 
-func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
+func TestDashboardLoginRejectsUsersWithoutConfiguredRepositoryWriteAccess(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -112,20 +116,37 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 	if err := store.ConfigureGitHubInstance(context.Background(), 7, "acme", 9, "https://env.example.test", "local.env"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.ProcessGitHubWebhook(context.Background(), githubapp.WebhookEvent{DeliveryID: "installation-1", EventType: "installation", InstallationID: 9, InstallationOrgID: 7, InstallationOrgLogin: "acme", RepositoriesAdded: []githubapp.Repository{{GitHubRepoID: 42, Owner: "acme", Name: "api", DefaultBranch: "main"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(context.Background(), sqlite.RepositoryConfigSnapshot{GitHubRepoID: 42, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []sqlite.RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}))
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/login/oauth/access_token":
 			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":11,"login":"outsider"}`))
-		case "/orgs/acme/members/outsider":
-			http.NotFound(w, r)
+		case "/app/installations/9/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
+		case "/repos/acme/api/collaborators/outsider/permission":
+			_, _ = w.Write([]byte(`{"permission":"read"}`))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(github.Close)
 	app := NewWithGitHubClient(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), GitHubOAuthClientID: "client", GitHubOAuthClientSecret: "non-secret-test", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: github.Client(), APIBaseURL: github.URL, OAuthURL: github.URL + "/login/oauth"})
+	if err := app.credentials.Save(githubapp.Credentials{AppID: 9, ClientID: "test-client", ClientSecret: "non-secret-test-client-secret", PrivateKeyPEM: privateKeyPEM, WebhookSecret: "non-secret-test-webhook-secret"}); err != nil {
+		t.Fatal(err)
+	}
 	start := httptest.NewRecorder()
 	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/login", nil))
 	location, err := url.Parse(start.Header().Get("Location"))
@@ -137,11 +158,11 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 	response := httptest.NewRecorder()
 	app.Handler().ServeHTTP(response, callback)
 	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "outsider") || strings.Contains(response.Body.String(), "oauth-token") {
-		t.Fatalf("non-member dashboard callback = %d %q", response.Code, response.Body.String())
+		t.Fatalf("repository-read dashboard callback = %d %q", response.Code, response.Body.String())
 	}
 }
 
-func TestDashboardLoginUsesActiveOrganizationMembership(t *testing.T) {
+func TestDashboardLoginUsesConfiguredRepositoryWriteAccess(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -150,20 +171,37 @@ func TestDashboardLoginUsesActiveOrganizationMembership(t *testing.T) {
 	if err := store.ConfigureGitHubInstance(context.Background(), 7, "acme", 9, "https://env.example.test", "local.env"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.ProcessGitHubWebhook(context.Background(), githubapp.WebhookEvent{DeliveryID: "installation-1", EventType: "installation", InstallationID: 9, InstallationOrgID: 7, InstallationOrgLogin: "acme", RepositoriesAdded: []githubapp.Repository{{GitHubRepoID: 42, Owner: "acme", Name: "api", DefaultBranch: "main"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(context.Background(), sqlite.RepositoryConfigSnapshot{GitHubRepoID: 42, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []sqlite.RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}))
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/login/oauth/access_token":
 			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":11,"login":"member"}`))
-		case "/orgs/acme/members/member":
-			w.WriteHeader(http.StatusNoContent)
+		case "/app/installations/9/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
+		case "/repos/acme/api/collaborators/member/permission":
+			_, _ = w.Write([]byte(`{"permission":"write"}`))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(github.Close)
 	app := NewWithGitHubClient(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), GitHubOAuthClientID: "client", GitHubOAuthClientSecret: "non-secret-test", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: github.Client(), APIBaseURL: github.URL, OAuthURL: github.URL + "/login/oauth"})
+	if err := app.credentials.Save(githubapp.Credentials{AppID: 9, ClientID: "test-client", ClientSecret: "non-secret-test-client-secret", PrivateKeyPEM: privateKeyPEM, WebhookSecret: "non-secret-test-webhook-secret"}); err != nil {
+		t.Fatal(err)
+	}
 	start := httptest.NewRecorder()
 	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/login", nil))
 	location, err := url.Parse(start.Header().Get("Location"))
@@ -179,50 +217,5 @@ func TestDashboardLoginUsesActiveOrganizationMembership(t *testing.T) {
 	}
 	if cookieNamed(t, response.Result().Cookies(), dashboardCookie) == nil {
 		t.Fatal("dashboard callback did not create a dashboard session")
-	}
-}
-
-func TestDashboardLoginLogsSafeOrganizationMembershipRedirect(t *testing.T) {
-	store, err := sqlite.Open(context.Background(), t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	if err := store.ConfigureGitHubInstance(context.Background(), 7, "acme", 9, "https://env.example.test", "local.env"); err != nil {
-		t.Fatal(err)
-	}
-	const oauthToken = "oauth-token-must-not-be-logged"
-	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/login/oauth/access_token":
-			_, _ = w.Write([]byte(`{"access_token":"` + oauthToken + `"}`))
-		case "/user":
-			_, _ = w.Write([]byte(`{"id":11,"login":"member"}`))
-		case "/orgs/acme/members/member":
-			w.Header().Set("Location", "https://github.com/orgs/acme")
-			w.WriteHeader(http.StatusFound)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(github.Close)
-	var logs bytes.Buffer
-	app := NewWithGitHubClientAndLogger(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), GitHubOAuthClientID: "client", GitHubOAuthClientSecret: "non-secret-test", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: github.Client(), APIBaseURL: github.URL, OAuthURL: github.URL + "/login/oauth"}, slog.New(slog.NewTextHandler(&logs, nil)))
-	start := httptest.NewRecorder()
-	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/login", nil))
-	location, err := url.Parse(start.Header().Get("Location"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	callback := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=code&state="+url.QueryEscape(location.Query().Get("state")), nil)
-	callback.AddCookie(cookieNamed(t, start.Result().Cookies(), oauthStateCookie))
-	response := httptest.NewRecorder()
-	app.Handler().ServeHTTP(response, callback)
-	if response.Code != http.StatusForbidden || strings.Contains(response.Body.String(), oauthToken) {
-		t.Fatalf("dashboard callback = %d %q", response.Code, response.Body.String())
-	}
-	output := logs.String()
-	if !strings.Contains(output, "github_operation=organization_membership") || !strings.Contains(output, "github_status=302") || !strings.Contains(output, "github_status_class=requester_not_organization_member") || strings.Contains(output, oauthToken) || strings.Contains(output, "https://github.com/orgs/acme") {
-		t.Fatalf("membership diagnostic log = %q", output)
 	}
 }

@@ -48,8 +48,6 @@ func (e *HTTPError) StatusClass() string {
 		return e.ResponseClass
 	}
 	switch e.StatusCode {
-	case http.StatusFound:
-		return "requester_not_organization_member"
 	case http.StatusUnauthorized:
 		return "unauthenticated"
 	case http.StatusForbidden:
@@ -172,38 +170,6 @@ func (c Client) AuthenticatedUser(ctx context.Context, token string) (User, erro
 		return User{}, errors.New("GitHub user response is incomplete")
 	}
 	return user, nil
-}
-
-// ActiveOrganizationMembership checks the authenticated user's active
-// membership directly. Unlike organization-listing endpoints, this check is
-// specific to the configured organization and user. Redirects are never
-// followed so the OAuth bearer token cannot be forwarded to another host.
-func (c Client) ActiveOrganizationMembership(ctx context.Context, token, organizationLogin, userLogin string) (bool, error) {
-	if !validGitHubLogin(organizationLogin) || !validGitHubLogin(userLogin) {
-		return false, errors.New("invalid GitHub organization membership subject")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiURL("orgs", organizationLogin, "members", userLogin), nil)
-	if err != nil {
-		return false, err
-	}
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	client := *c.httpClient()
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	response, err := client.Do(request)
-	if err != nil {
-		return false, fmt.Errorf("check GitHub organization membership: %w", err)
-	}
-	defer response.Body.Close()
-	switch response.StatusCode {
-	case http.StatusNoContent:
-		return true, nil
-	case http.StatusNotFound, http.StatusFound:
-		return false, &HTTPError{Operation: "organization_membership", StatusCode: response.StatusCode}
-	default:
-		return false, &HTTPError{Operation: "organization_membership", StatusCode: response.StatusCode, PermissionRequirement: safeAcceptedPermissions(response.Header.Get("X-Accepted-GitHub-Permissions")), ResponseClass: safeResponseClass(response.StatusCode, response.Header)}
-	}
 }
 
 type ManifestConversion struct {

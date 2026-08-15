@@ -654,19 +654,13 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
 			return
 		}
-		active, membershipErr := s.github.ActiveOrganizationMembership(ctx, token, organization.Login, user.Login)
-		if membershipErr != nil {
-			var githubError *githubapp.HTTPError
-			if errors.As(membershipErr, &githubError) && (githubError.StatusCode == http.StatusFound || githubError.StatusCode == http.StatusNotFound) {
-				s.logGitHubMembershipFailure(membershipErr)
-				http.Error(w, "GitHub account "+user.Login+" does not have an active membership in the configured organization", http.StatusForbidden)
-				return
-			}
-			http.Error(w, "GitHub organization membership verification failed", http.StatusBadGateway)
+		allowed, authorizationErr := s.hasDashboardRepositoryWriteAccess(ctx, store, user)
+		if authorizationErr != nil {
+			http.Error(w, "GitHub repository authorization is unavailable", http.StatusBadGateway)
 			return
 		}
-		if !active {
-			http.Error(w, "GitHub account "+user.Login+" does not have an active membership in the configured organization", http.StatusForbidden)
+		if !allowed {
+			http.Error(w, "GitHub account "+user.Login+" does not have write access to every configured repository", http.StatusForbidden)
 			return
 		}
 		session := dashboardSession{User: user, OrganizationID: organization.ID, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
@@ -1322,16 +1316,40 @@ func (s *Server) logGitHubPublicationFailure(err error) {
 	s.logger.Warn("GitHub readiness publication failed", "github_status_class", "transport_or_response")
 }
 
-// logGitHubMembershipFailure deliberately records only fixed diagnostic
-// metadata. In particular, it never records OAuth credentials, redirect
-// locations, request headers, or GitHub response bodies.
-func (s *Server) logGitHubMembershipFailure(err error) {
-	var githubError *githubapp.HTTPError
-	if errors.As(err, &githubError) {
-		s.logger.Warn("GitHub organization membership verification denied", "github_operation", githubError.Operation, "github_status", githubError.StatusCode, "github_status_class", githubError.StatusClass())
-		return
+// hasDashboardRepositoryWriteAccess ensures a dashboard session can expose
+// metadata for every configured repository. It uses only the selected-
+// repository installation token and never persists the OAuth token used to
+// identify the GitHub account.
+func (s *Server) hasDashboardRepositoryWriteAccess(ctx context.Context, store dashboardStore, user githubapp.User) (bool, error) {
+	stateStore, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		return false, errors.New("repository authorization store is unavailable")
 	}
-	s.logger.Warn("GitHub organization membership verification failed", "github_status_class", "transport_or_response")
+	repositories, err := store.DashboardRepositories(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(repositories) == 0 {
+		return false, nil
+	}
+	credentials, found, err := s.credentials.Load()
+	if err != nil || !found {
+		return false, errors.New("GitHub App credentials are unavailable")
+	}
+	for _, repository := range repositories {
+		state, err := stateStore.RepositoryCryptoState(ctx, repository.Owner, repository.Name)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := s.github.HasRepositoryWriteAccess(ctx, credentials, state.InstallationID, state.Owner, state.Name, user.Login)
+		if err != nil {
+			return false, err
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func readinessText(requirements []pranalysis.Requirement, detailsURL string) (summary, comment string, success bool) {

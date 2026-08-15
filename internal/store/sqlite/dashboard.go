@@ -46,7 +46,7 @@ type AuditEvent struct {
 }
 
 // DashboardOrganization identifies the one organization configured for the
-// instance, allowing the server to check an OAuth user's direct membership.
+// instance and binds dashboard sessions to that configuration.
 func (s *Store) DashboardOrganization(ctx context.Context) (githubapp.Organization, error) {
 	var organization githubapp.Organization
 	if err := s.db.QueryRowContext(ctx, `SELECT github_org_id, github_org_login FROM instance WHERE id = 'singleton'`).Scan(&organization.ID, &organization.Login); err != nil {
