@@ -168,11 +168,23 @@ func (c Client) ActiveOrganizationMembership(ctx context.Context, token, organiz
 	if !validGitHubLogin(organizationLogin) {
 		return Organization{}, errors.New("invalid GitHub organization login")
 	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiURL("user", "memberships", "orgs", organizationLogin), nil)
+	if err != nil {
+		return Organization{}, err
+	}
+	response, err := c.authorized(request, token)
+	if err != nil {
+		return Organization{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return Organization{}, &HTTPError{Operation: "organization_membership", StatusCode: response.StatusCode, PermissionRequirement: safeAcceptedPermissions(response.Header.Get("X-Accepted-GitHub-Permissions")), ResponseClass: safeResponseClass(response.StatusCode, response.Header)}
+	}
 	var membership struct {
 		State        string       `json:"state"`
 		Organization Organization `json:"organization"`
 	}
-	if err := c.getJSON(ctx, "/user/memberships/orgs/"+url.PathEscape(organizationLogin), token, &membership); err != nil {
+	if err := decodeJSON(response.Body, &membership); err != nil {
 		return Organization{}, err
 	}
 	if membership.State != "active" || membership.Organization.ID <= 0 || membership.Organization.Login != organizationLogin {

@@ -63,3 +63,23 @@ func TestHTTPErrorClassifiesSafeGitHub403ResponseHeaders(t *testing.T) {
 		t.Fatalf("ordinary 403 class = %q, want empty", got)
 	}
 }
+
+func TestActiveOrganizationMembershipPreservesSafeHTTPFailure(t *testing.T) {
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/memberships/orgs/acme" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("X-Accepted-GitHub-Permissions", "metadata=read")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(github.Close)
+	_, err := (Client{HTTPClient: github.Client(), APIBaseURL: github.URL}).ActiveOrganizationMembership(context.Background(), "test-oauth-token", "acme")
+	var githubError *HTTPError
+	if !errors.As(err, &githubError) {
+		t.Fatalf("ActiveOrganizationMembership() error = %v, want HTTPError", err)
+	}
+	if githubError.Operation != "organization_membership" || githubError.StatusCode != http.StatusForbidden || githubError.PermissionRequirement != "metadata_read" {
+		t.Fatalf("HTTPError = %#v", githubError)
+	}
+}

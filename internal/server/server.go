@@ -650,6 +650,7 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		membership, membershipErr := s.github.ActiveOrganizationMembership(ctx, token, organization.Login)
 		if membershipErr != nil || membership.ID != organization.ID {
+			s.logGitHubDashboardMembershipFailure(membershipErr)
 			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
 			return
 		}
@@ -1304,6 +1305,24 @@ func (s *Server) logGitHubPublicationFailure(err error) {
 		return
 	}
 	s.logger.Warn("GitHub readiness publication failed", "github_status_class", "transport_or_response")
+}
+
+// logGitHubDashboardMembershipFailure retains only safe GitHub HTTP metadata.
+// OAuth tokens, user data, response bodies, and organization identifiers must
+// never enter logs.
+func (s *Server) logGitHubDashboardMembershipFailure(err error) {
+	var githubError *githubapp.HTTPError
+	if errors.As(err, &githubError) {
+		attributes := []any{"github_operation", githubError.Operation, "github_status", githubError.StatusCode, "github_status_class", githubError.StatusClass()}
+		if githubError.PermissionRequirement != "" {
+			attributes = append(attributes, "github_permission_requirement", githubError.PermissionRequirement)
+		}
+		s.logger.Warn("GitHub dashboard membership check failed", attributes...)
+		return
+	}
+	if err != nil {
+		s.logger.Warn("GitHub dashboard membership check failed", "github_status_class", "transport_or_response")
+	}
 }
 
 func readinessText(requirements []pranalysis.Requirement, detailsURL string) (summary, comment string, success bool) {

@@ -55,6 +55,16 @@ func TestGitHubPublicationFailureLogsOnlySafeStatusMetadata(t *testing.T) {
 	}
 }
 
+func TestDashboardMembershipFailureLogsOnlySafeStatusMetadata(t *testing.T) {
+	var logs bytes.Buffer
+	app := NewWithGitHubClientAndLogger(config.Config{}, testStore{}, githubapp.DefaultClient(), slog.New(slog.NewTextHandler(&logs, nil)))
+	app.logGitHubDashboardMembershipFailure(&githubapp.HTTPError{Operation: "organization_membership", StatusCode: http.StatusForbidden, PermissionRequirement: "metadata_read"})
+	output := logs.String()
+	if !strings.Contains(output, "github_operation=organization_membership") || !strings.Contains(output, "github_status=403") || !strings.Contains(output, "github_status_class=forbidden") || !strings.Contains(output, "github_permission_requirement=metadata_read") || strings.Contains(output, "error=") {
+		t.Fatalf("dashboard membership log = %q", output)
+	}
+}
+
 func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), t.TempDir())
 	if err != nil {
