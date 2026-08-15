@@ -36,9 +36,52 @@ import (
 
 const keyringService = "localenv"
 
+const (
+	ansiReset  = "\x1b[0m"
+	ansiRed    = "\x1b[31m"
+	ansiGreen  = "\x1b[32m"
+	ansiYellow = "\x1b[33m"
+	ansiCyan   = "\x1b[36m"
+)
+
+type styledOutput struct {
+	writer      io.Writer
+	enabled     bool
+	errorOutput bool
+}
+
+func (w styledOutput) Write(data []byte) (int, error) {
+	if !w.enabled || !w.errorOutput || len(data) == 0 {
+		return w.writer.Write(data)
+	}
+	if _, err := io.WriteString(w.writer, ansiRed); err != nil {
+		return 0, err
+	}
+	n, err := w.writer.Write(data)
+	if _, resetErr := io.WriteString(w.writer, ansiReset); err == nil {
+		err = resetErr
+	}
+	return n, err
+}
+
+func decorateOutput(writer io.Writer, errorOutput bool) io.Writer {
+	file, isFile := writer.(*os.File)
+	return styledOutput{writer: writer, enabled: isFile && term.IsTerminal(int(file.Fd())) && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb", errorOutput: errorOutput}
+}
+
+func styled(out io.Writer, color, text string) string {
+	writer, ok := out.(styledOutput)
+	if !ok || !writer.enabled {
+		return text
+	}
+	return color + text + ansiReset
+}
+
 // Run executes P4 commands. Values stored by this package are session tokens
 // and age identities only; neither is ever printed.
 func Run(args []string, out, errOut io.Writer) int {
+	out = decorateOutput(out, false)
+	errOut = decorateOutput(errOut, true)
 	if len(args) == 0 {
 		usage(out)
 		return 2
@@ -83,8 +126,8 @@ func Run(args []string, out, errOut io.Writer) int {
 }
 
 func usage(out io.Writer) {
-	fmt.Fprintln(out, "Usage: localenv <command>")
-	fmt.Fprintln(out, "\nCommands:")
+	fmt.Fprintln(out, styled(out, ansiCyan, "Usage: localenv <command>"))
+	fmt.Fprintln(out, "\n"+styled(out, ansiCyan, "Commands:"))
 	fmt.Fprintln(out, "  login <instance-url>  Sign in with GitHub and register this device")
 	fmt.Fprintln(out, "  status                Show signed-in user, repository, and device")
 	fmt.Fprintln(out, "  logout                Revoke and remove the local session")
@@ -283,14 +326,16 @@ func boolExit(ok bool) int {
 
 func doctorResult(out io.Writer, check string, ok bool, detail string) {
 	status := "FAIL"
+	color := ansiRed
 	if ok {
 		status = "OK"
+		color = ansiGreen
 	}
 	if detail == "" {
-		fmt.Fprintf(out, "%s %s\n", status, check)
+		fmt.Fprintf(out, "%s %s\n", styled(out, color, status), check)
 		return
 	}
-	fmt.Fprintf(out, "%s %s: %s\n", status, check, detail)
+	fmt.Fprintf(out, "%s %s: %s\n", styled(out, color, status), check, detail)
 }
 
 func instanceReachable(instance string) bool {
@@ -615,13 +660,13 @@ func printChange(out io.Writer, target string, change dotenv.ManagedResult, dryR
 		prefix = "Would "
 	}
 	for _, key := range change.Added {
-		fmt.Fprintf(out, "%sadd: %s: %s\n", prefix, target, key)
+		fmt.Fprintf(out, "%s: %s: %s\n", styled(out, ansiGreen, prefix+"add"), target, key)
 	}
 	for _, key := range change.Updated {
-		fmt.Fprintf(out, "%supdate: %s: %s\n", prefix, target, key)
+		fmt.Fprintf(out, "%s: %s: %s\n", styled(out, ansiYellow, prefix+"update"), target, key)
 	}
 	for _, key := range change.Removed {
-		fmt.Fprintf(out, "%sremove: %s: %s\n", prefix, target, key)
+		fmt.Fprintf(out, "%s: %s: %s\n", styled(out, ansiRed, prefix+"remove"), target, key)
 	}
 }
 
@@ -957,13 +1002,21 @@ func runSet(args []string, out, errOut io.Writer) int {
 }
 
 func hiddenValue(out io.Writer) ([]byte, error) {
-	fmt.Fprint(out, "Value: ")
+	fmt.Fprint(out, styled(out, ansiCyan, "Value:")+" ")
 	state, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return nil, err
 	}
-	defer term.Restore(int(os.Stdin.Fd()), state)
-	return maskedValue(os.Stdin, out)
+	value, readErr := maskedValue(os.Stdin, out)
+	restoreErr := term.Restore(int(os.Stdin.Fd()), state)
+	if readErr != nil {
+		return nil, readErr
+	}
+	if restoreErr != nil {
+		clear(value)
+		return nil, restoreErr
+	}
+	return value, nil
 }
 
 // maskedValue accepts a terminal value without echoing its contents while
@@ -977,10 +1030,10 @@ func maskedValue(input io.Reader, out io.Writer) ([]byte, error) {
 		if n > 0 {
 			switch byteBuffer[0] {
 			case '\r', '\n':
-				fmt.Fprintln(out)
+				fmt.Fprint(out, "\r\n")
 				return value, nil
 			case 3, 4:
-				fmt.Fprintln(out)
+				fmt.Fprint(out, "\r\n")
 				clear(value)
 				return nil, errors.New("secret input interrupted")
 			case '\b', 127:

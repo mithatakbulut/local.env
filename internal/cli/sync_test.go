@@ -225,8 +225,36 @@ func TestMaskedValueShowsOnlyAsterisksAndHandlesBackspace(t *testing.T) {
 	if got, want := string(value), "valuX"; got != want {
 		t.Fatalf("masked value = %q, want %q", got, want)
 	}
-	if got, want := output.String(), "*****\b \b*\n"; got != want || strings.Contains(got, "value") {
+	if got, want := output.String(), "*****\b \b*\r\n"; got != want || strings.Contains(got, "value") {
 		t.Fatalf("masked output = %q, want only %q", got, want)
+	}
+}
+
+func TestStyledOutputPreservesPlainTextWithoutTerminalColor(t *testing.T) {
+	var output bytes.Buffer
+	writer := styledOutput{writer: &output}
+	if got := styled(writer, ansiGreen, "OK"); got != "OK" {
+		t.Fatalf("plain styled text = %q", got)
+	}
+	if _, err := writer.Write([]byte("problem")); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); got != "problem" {
+		t.Fatalf("plain writer output = %q", got)
+	}
+}
+
+func TestStyledOutputColorsInteractiveErrors(t *testing.T) {
+	var output bytes.Buffer
+	writer := styledOutput{writer: &output, enabled: true, errorOutput: true}
+	if got := styled(writer, ansiGreen, "OK"); got != ansiGreen+"OK"+ansiReset {
+		t.Fatalf("styled text = %q", got)
+	}
+	if _, err := writer.Write([]byte("problem")); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); got != ansiRed+"problem"+ansiReset {
+		t.Fatalf("colored writer output = %q", got)
 	}
 }
 
