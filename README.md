@@ -99,3 +99,22 @@ go vet ./...
 go test ./...
 go build ./cmd/localenv ./cmd/localenv-server
 ```
+
+## CLI runtime mode
+
+For a development command that should not require a managed plaintext dotenv
+file, use runtime injection:
+
+```bash
+localenv run -- npm run dev
+```
+
+The CLI downloads and decrypts the selected repository snapshot in its own
+memory, then starts the child command with the managed keys in its environment.
+It does not create or update any configured `.env.local` target. Child programs
+can still choose to write their own files, so configure them accordingly.
+
+Use `localenv doctor` to check the instance, GitHub session, local repository
+contract, target ignore/permission safety, device identity, and availability of
+the repository encryption key. It is diagnostic only and does not modify local
+dotenv targets.

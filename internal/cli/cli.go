@@ -62,6 +62,10 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runSync(args[1:], out, errOut)
 	case "diff":
 		return runDiff(args[1:], out, errOut)
+	case "run":
+		return runRuntime(args[1:], out, errOut)
+	case "doctor":
+		return runDoctor(args[1:], out, errOut)
 	case "devices":
 		return runDevices(args[1:], out, errOut)
 	case "--version", "version":
@@ -88,7 +92,228 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  import FILE           Encrypt declared values from a local dotenv file")
 	fmt.Fprintln(out, "  sync                  Download, decrypt, and safely update local dotenv files")
 	fmt.Fprintln(out, "  diff                  Show key-level local/remote dotenv differences")
+	fmt.Fprintln(out, "  run -- COMMAND        Run a command with managed values injected in memory")
+	fmt.Fprintln(out, "  doctor                Check local.env connectivity and local configuration")
 	fmt.Fprintln(out, "  devices               List, approve, or revoke repository devices")
+}
+
+// runRuntime decrypts the repository snapshot only in this process, adds its
+// declared values to a child environment, and never touches dotenv targets.
+func runRuntime(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("run", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	pr := flags.Int("pr", 0, "include pending values from this pull request")
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() == 0 || *pr < 0 {
+		fmt.Fprintln(errOut, "Usage: localenv run [--pr NUMBER] [--repo owner/name] [--instance instance-url] [--credential-file path] -- COMMAND [ARG...]")
+		return 2
+	}
+	snapshot, _, err := syncSnapshot(*repositoryFlag, *instanceFlag, *credentialFile, *pr)
+	if err != nil {
+		var pending deviceAccessPendingError
+		if errors.As(err, &pending) {
+			fmt.Fprintf(errOut, "Access pending. Approval code: %s\n", pending.Code)
+			return 1
+		}
+		fmt.Fprintln(errOut, "localenv: could not download and decrypt the repository snapshot; no command was started")
+		return 1
+	}
+	defer clearSnapshot(snapshot)
+	environment, err := runtimeEnvironment(os.Environ(), snapshot)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: the repository contract assigns one environment key to multiple targets; no command was started")
+		return 1
+	}
+	commandArgs := flags.Args()
+	command := exec.Command(commandArgs[0], commandArgs[1:]...)
+	command.Env = environment
+	command.Stdin = os.Stdin
+	command.Stdout = out
+	command.Stderr = errOut
+	if err := command.Run(); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			fmt.Fprintf(errOut, "localenv: command exited with status %d\n", exit.ExitCode())
+			return exit.ExitCode()
+		}
+		fmt.Fprintln(errOut, "localenv: could not start command")
+		return 1
+	}
+	return 0
+}
+
+// runtimeEnvironment replaces inherited keys once and rejects ambiguous
+// duplicate managed keys rather than silently selecting one dotenv target.
+func runtimeEnvironment(inherited []string, snapshot decryptedSnapshot) ([]string, error) {
+	managed := make(map[string][]byte)
+	for _, target := range sortedTargets(snapshot) {
+		for key, value := range snapshot[target] {
+			if _, exists := managed[key]; exists {
+				return nil, errors.New("duplicate runtime key")
+			}
+			managed[key] = value
+		}
+	}
+	environment := make([]string, 0, len(inherited)+len(managed))
+	for _, entry := range inherited {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+		if _, overridden := managed[key]; !overridden {
+			environment = append(environment, entry)
+		}
+	}
+	for _, key := range sortedRuntimeKeys(managed) {
+		environment = append(environment, key+"="+string(managed[key]))
+	}
+	return environment, nil
+}
+
+func sortedRuntimeKeys(values map[string][]byte) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func runDoctor(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		fmt.Fprintln(errOut, "Usage: localenv doctor [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+
+	ok := true
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		doctorResult(out, "credential storage", false, "unavailable")
+		return 1
+	}
+	instance, token, sessionErr := currentSession(secrets, *instanceFlag)
+	if sessionErr != nil {
+		doctorResult(out, "GitHub authentication", false, "not signed in")
+		ok = false
+	} else {
+		if instanceReachable(instance) {
+			doctorResult(out, "instance reachable", true, "")
+		} else {
+			doctorResult(out, "instance reachable", false, "unavailable")
+			ok = false
+		}
+		if _, err := fetchMe(context.Background(), instance, token); err != nil {
+			doctorResult(out, "GitHub authentication", false, "invalid or expired")
+			ok = false
+		} else {
+			doctorResult(out, "GitHub authentication", true, "")
+		}
+	}
+
+	gitIdentity, gitErr := repository.Detect(context.Background(), ".")
+	if gitErr != nil {
+		doctorResult(out, "repository recognized", false, "not a supported GitHub repository")
+		return 1
+	}
+	doctorResult(out, "repository recognized", true, "")
+	owner, name := gitIdentity.Owner, gitIdentity.Name
+	if *repositoryFlag != "" {
+		var err error
+		owner, name, err = selectedRepository(*repositoryFlag)
+		if err != nil {
+			doctorResult(out, "selected repository", false, "invalid")
+			return 1
+		}
+	}
+	contract, contractErr := repository.LoadSnapshot(gitIdentity.Root)
+	if contractErr != nil {
+		doctorResult(out, "localenv.yaml", false, "invalid")
+		ok = false
+	} else {
+		doctorResult(out, "localenv.yaml", true, "")
+		for _, file := range contract.Files {
+			if doctorTargetSafe(gitIdentity.Root, file.Target) {
+				doctorResult(out, "target "+file.Target, true, "ignored and safe")
+			} else {
+				doctorResult(out, "target "+file.Target, false, "must be Git-ignored and, when present, mode 0600")
+				ok = false
+			}
+		}
+	}
+	if sessionErr != nil {
+		return 1
+	}
+	identity, identityErr := loadIdentity(secrets, instance)
+	if identityErr != nil {
+		doctorResult(out, "device key", false, "not found")
+		return 1
+	}
+	doctorResult(out, "device key", true, "")
+	snapshot, snapshotErr := fetchRepositorySnapshot(context.Background(), instance, token, owner, name)
+	if snapshotErr != nil {
+		doctorResult(out, "repository encryption key", false, "unavailable")
+		return 1
+	}
+	rek, unwrapErr := cryptokit.UnwrapREK(identity.Identity, snapshot.WrappedREK)
+	if unwrapErr != nil {
+		doctorResult(out, "repository encryption key", false, "unavailable for this device")
+		return 1
+	}
+	clear(rek)
+	doctorResult(out, "repository encryption key", true, "")
+	return boolExit(ok)
+}
+
+func boolExit(ok bool) int {
+	if ok {
+		return 0
+	}
+	return 1
+}
+
+func doctorResult(out io.Writer, check string, ok bool, detail string) {
+	status := "FAIL"
+	if ok {
+		status = "OK"
+	}
+	if detail == "" {
+		fmt.Fprintf(out, "%s %s\n", status, check)
+		return
+	}
+	fmt.Fprintf(out, "%s %s: %s\n", status, check, detail)
+}
+
+func instanceReachable(instance string) bool {
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, instance+"/healthz", nil)
+	if err != nil {
+		return false
+	}
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	return response.StatusCode >= 200 && response.StatusCode < 300
+}
+
+func doctorTargetSafe(root, target string) bool {
+	ignored, err := gitIgnored(root, target)
+	if err != nil || !ignored {
+		return false
+	}
+	path, err := safeLocalTarget(root, target)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(path)
+	return errors.Is(err, os.ErrNotExist) || (err == nil && info.Mode().Perm() == 0o600)
 }
 
 func runSync(args []string, out, errOut io.Writer) int {

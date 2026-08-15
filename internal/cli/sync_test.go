@@ -178,3 +178,162 @@ func TestSecondDeveloperSyncDecryptsMergedSnapshotWithoutChangingLocalContent(t 
 		t.Fatalf("second developer sync = content %q, out %q, err %q, read %v", content, out.String(), errOut.String(), err)
 	}
 }
+
+func TestRuntimeHelperProcess(t *testing.T) {
+	if os.Getenv("LOCALENV_RUNTIME_HELPER") != "1" {
+		return
+	}
+	if os.Getenv("DATABASE_URL") != "runtime-test-sentinel" {
+		os.Exit(55)
+	}
+	if os.Getenv("LOCALENV_RUNTIME_HELPER_MODE") == "fail" {
+		os.Exit(42)
+	}
+	os.Exit(0)
+}
+
+func TestRunInjectsManagedValuesWithoutWritingDotenvTarget(t *testing.T) {
+	root, server, credentials := runtimeTestRepository(t)
+	defer server.Close()
+	t.Setenv("LOCALENV_RUNTIME_HELPER", "1")
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+
+	target := filepath.Join(root, ".env.local")
+	var out, errOut bytes.Buffer
+	code := runRuntime([]string{"--instance", server.URL, "--credential-file", credentials.path, "--", os.Args[0], "-test.run=^TestRuntimeHelperProcess$", "--"}, &out, &errOut)
+	if code != 0 || out.Len() != 0 || errOut.Len() != 0 {
+		t.Fatalf("runtime result = code %d, out %q, err %q", code, out.String(), errOut.String())
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("runtime created dotenv target: %v", err)
+	}
+}
+
+func TestRunReturnsChildExitStatusWithoutExposingSnapshotValue(t *testing.T) {
+	root, server, credentials := runtimeTestRepository(t)
+	defer server.Close()
+	t.Setenv("LOCALENV_RUNTIME_HELPER", "1")
+	t.Setenv("LOCALENV_RUNTIME_HELPER_MODE", "fail")
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+	var out, errOut bytes.Buffer
+	code := runRuntime([]string{"--instance", server.URL, "--credential-file", credentials.path, "--", os.Args[0], "-test.run=^TestRuntimeHelperProcess$", "--"}, &out, &errOut)
+	if code != 42 || !strings.Contains(errOut.String(), "status 42") || strings.Contains(out.String()+errOut.String(), "runtime-test-sentinel") {
+		t.Fatalf("runtime failure = code %d, out %q, err %q", code, out.String(), errOut.String())
+	}
+}
+
+func TestDoctorChecksRuntimePrerequisites(t *testing.T) {
+	root, server, credentials := runtimeTestRepository(t)
+	defer server.Close()
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+	if err := os.WriteFile(filepath.Join(root, ".env.local"), []byte("LOCAL_ONLY=true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code := runDoctor([]string{"--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
+	if code != 0 || errOut.Len() != 0 || !strings.Contains(out.String(), "OK instance reachable") || !strings.Contains(out.String(), "OK GitHub authentication") || !strings.Contains(out.String(), "OK repository recognized") || !strings.Contains(out.String(), "OK localenv.yaml") || !strings.Contains(out.String(), "OK target .env.local") || !strings.Contains(out.String(), "OK device key") || !strings.Contains(out.String(), "OK repository encryption key") || strings.Contains(out.String(), "runtime-test-sentinel") {
+		t.Fatalf("doctor result = code %d, out %q, err %q", code, out.String(), errOut.String())
+	}
+	if err := os.Chmod(filepath.Join(root, ".env.local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	code = runDoctor([]string{"--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
+	if code != 1 || !strings.Contains(out.String(), "FAIL target .env.local") {
+		t.Fatalf("doctor unsafe target = code %d, out %q", code, out.String())
+	}
+}
+
+func runtimeTestRepository(t *testing.T) (string, *httptest.Server, *fileStore) {
+	t.Helper()
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "-q", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", root, "remote", "add", "origin", "https://github.com/acme/api.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote: %v: %s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(root, "localenv.yaml"), []byte("version: 1\nfiles:\n  - schema: .env.example\n    target: .env.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".env.example"), []byte("DATABASE_URL=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".env.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rek := []byte("non-secret-test-rek-sentinel-000")
+	wrapped, err := cryptokit.WrapREK(rek, identity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileID := pranalysis.FileID(17, ".env.example", ".env.local")
+	envelope, err := cryptokit.Encrypt(rek, []byte("runtime-test-sentinel"), cryptokit.AAD{InstanceID: "edb7f4f6-4bc5-4eca-91cd-bfde8588e2a9", GitHubRepoID: 17, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Version: 1, KeyEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-session" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v1/repos/acme/api/pulls/current":
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/repos/acme/api/snapshot":
+			_ = json.NewEncoder(w).Encode(apiRepositorySnapshot{Repository: apiRepositoryCryptoState{InstanceID: "edb7f4f6-4bc5-4eca-91cd-bfde8588e2a9", GitHubRepoID: 17, Owner: "acme", Name: "api", ActiveKeyEpoch: 1, Initialized: true}, WrappedREK: wrapped, Secrets: []apiSecretSnapshot{{FileID: fileID, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Envelope: envelope}}})
+		case "/api/v1/me":
+			_ = json.NewEncoder(w).Encode(apiMe{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	credentials := &fileStore{path: filepath.Join(t.TempDir(), "credentials.json")}
+	if err := credentials.Set("last-instance", server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentials.Set(sessionKey(server.URL), "test-session"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := json.Marshal(struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Identity string `json:"identity"`
+	}{ID: "device-runtime", Name: "runtime device", Identity: identity.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := credentials.Set(identityKey(server.URL), string(saved)); err != nil {
+		t.Fatal(err)
+	}
+	return root, server, credentials
+}
