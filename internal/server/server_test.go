@@ -3,9 +3,15 @@ package server
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -62,7 +68,7 @@ func TestGitHubWebhookVerifiesSignatureBeforeProcessing(t *testing.T) {
 	if err := app.credentials.Save(githubapp.Credentials{AppID: 1, ClientID: "test-client", ClientSecret: "test-client-secret", PrivateKeyPEM: "test-private-key", WebhookSecret: "test-webhook-secret"}); err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte(`{"action":"opened","installation":{"id":7,"account":{"id":2,"login":"acme"}}}`)
+	payload := []byte(`{"action":"opened","number":100,"installation":{"id":7,"account":{"id":2,"login":"acme"}},"repository":{"id":17,"name":"api","owner":{"login":"acme"},"default_branch":"main"},"pull_request":{"head":{"sha":"head"},"base":{"sha":"base"},"user":{"id":5}}}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/github/webhook", strings.NewReader(string(payload)))
 	request.Header.Set("X-GitHub-Event", "pull_request")
 	request.Header.Set("X-GitHub-Delivery", "delivery-1")
@@ -88,6 +94,86 @@ func TestGitHubWebhookVerifiesSignatureBeforeProcessing(t *testing.T) {
 	if store.calls != 1 {
 		t.Errorf("unverified webhook was processed")
 	}
+}
+
+func TestPullRequestWebhookPublishesPreciseReadinessAndUpdatesStickyArtifacts(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}))
+	var checkMethods, commentMethods []string
+	fakeGitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/7/access_tokens":
+			if r.Method != http.MethodPost {
+				t.Errorf("installation token method = %s", r.Method)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
+		case "/repos/acme/api/contents/localenv.yaml":
+			_, _ = w.Write(gitHubFile("version: 1\nfiles:\n  - schema: .env.example\n    target: .env.local\n"))
+		case "/repos/acme/api/contents/.env.example":
+			if r.URL.Query().Get("ref") == "base" {
+				_, _ = w.Write(gitHubFile("EXISTING=non-secret-schema-default\n"))
+				return
+			}
+			_, _ = w.Write(gitHubFile("EXISTING=non-secret-schema-default\nSTRIPE_SECRET_KEY=non-secret-schema-default\n"))
+		case "/repos/acme/api/check-runs", "/repos/acme/api/check-runs/101":
+			body, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(body), "STRIPE_SECRET_KEY") || strings.Contains(string(body), "non-secret-schema-default") {
+				t.Errorf("Check Run payload must contain only the missing key name: %s", body)
+			}
+			checkMethods = append(checkMethods, r.Method)
+			_, _ = w.Write([]byte(`{"id":101}`))
+		case "/repos/acme/api/issues/100/comments", "/repos/acme/api/issues/comments/202":
+			commentMethods = append(commentMethods, r.Method)
+			_, _ = w.Write([]byte(`{"id":202}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fakeGitHub.Close)
+
+	dataDir := t.TempDir()
+	store, err := sqlite.Open(context.Background(), dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveRepositoryConfigSnapshot(context.Background(), sqlite.RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []sqlite.RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	app := NewWithGitHubClient(config.Config{DataDir: dataDir, PublicURL: mustURL(t, "https://env.example.test"), GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: fakeGitHub.Client(), APIBaseURL: fakeGitHub.URL})
+	if err := app.credentials.Save(githubapp.Credentials{AppID: 1, ClientID: "test-client", ClientSecret: "test-client-secret", PrivateKeyPEM: pemKey, WebhookSecret: "test-webhook-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"action":"opened","number":100,"installation":{"id":7,"account":{"id":2,"login":"acme"}},"repository":{"id":17,"name":"api","owner":{"login":"acme"},"default_branch":"main"},"pull_request":{"head":{"sha":"head"},"base":{"sha":"base"},"user":{"id":5}}}`)
+	for _, deliveryID := range []string{"delivery-pr-1", "delivery-pr-2"} {
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/github/webhook", strings.NewReader(string(payload)))
+		request.Header.Set("X-GitHub-Event", "pull_request")
+		request.Header.Set("X-GitHub-Delivery", deliveryID)
+		request.Header.Set("X-Hub-Signature-256", webhookSignature("test-webhook-secret", payload))
+		recorder := httptest.NewRecorder()
+		app.Handler().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("PR webhook status = %d, body = %q", recorder.Code, recorder.Body.String())
+		}
+	}
+	if got, want := strings.Join(checkMethods, ","), "POST,PATCH"; got != want {
+		t.Errorf("Check Run methods = %s, want %s", got, want)
+	}
+	if got, want := strings.Join(commentMethods, ","), "POST,PATCH"; got != want {
+		t.Errorf("comment methods = %s, want %s", got, want)
+	}
+	requirements, err := store.PullRequestRequirements(context.Background(), 17, 100)
+	if err != nil || len(requirements) != 1 || requirements[0].KeyName != "STRIPE_SECRET_KEY" || requirements[0].State != "missing" {
+		t.Fatalf("stored requirements = %#v, %v", requirements, err)
+	}
+}
+
+func gitHubFile(contents string) []byte {
+	return []byte(`{"type":"file","encoding":"base64","content":"` + base64.StdEncoding.EncodeToString([]byte(contents)) + `"}`)
 }
 
 func TestSetupFlowStoresOnlyEncryptedGitHubCredentialsAndBecomesReady(t *testing.T) {

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/localenv/localenv/internal/githubapp"
+	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/migrations"
 )
 
@@ -44,6 +46,41 @@ func TestOpenAppliesMigrationsWALAndPermissions(t *testing.T) {
 	}
 	if count != len(migrations.Names) {
 		t.Errorf("migration count = %d, want %d", count, len(migrations.Names))
+	}
+}
+
+func TestPullRequestRequirementsPersistWithoutSchemaValuesAndKeepPublicationIDs(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveRepositoryConfigSnapshot(context.Background(), RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	pull := githubapp.PullRequest{Number: 100, BaseSHA: "base", HeadSHA: "head", AuthorID: 5, State: "open", Repository: githubapp.Repository{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main"}}
+	requirements := []pranalysis.Requirement{{FileID: pranalysis.FileID(17, ".env.example", ".env.local"), KeyName: "STRIPE_SECRET_KEY", State: pranalysis.StateMissing}}
+	readiness, err := store.SavePullRequestRequirements(context.Background(), pull, requirements)
+	if err != nil || readiness.CheckRunID != 0 || readiness.CommentID != 0 {
+		t.Fatalf("SavePullRequestRequirements() = (%#v, %v), want no publication IDs", readiness, err)
+	}
+	if err := store.SaveReadinessPublication(context.Background(), 17, 100, 101, 202); err != nil {
+		t.Fatal(err)
+	}
+	readiness, err = store.SavePullRequestRequirements(context.Background(), pull, requirements)
+	if err != nil || readiness.CheckRunID != 101 || readiness.CommentID != 202 {
+		t.Fatalf("re-saved readiness = (%#v, %v), want retained IDs", readiness, err)
+	}
+	if err := store.ClosePullRequest(context.Background(), githubapp.PullRequest{Number: 100, BaseSHA: "base", HeadSHA: "head", AuthorID: 5, State: "merged", Repository: pull.Repository}); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := store.db.QueryRow(`SELECT state FROM pull_requests WHERE repository_id = 'github:17' AND pr_number = 100`).Scan(&state); err != nil || state != "merged" {
+		t.Fatalf("stored PR state = %q, %v; want merged", state, err)
+	}
+	var schemaDefaultCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pr_requirements WHERE key_name LIKE '%non-secret-schema-default%'`).Scan(&schemaDefaultCount); err != nil || schemaDefaultCount != 0 {
+		t.Fatalf("schema defaults persisted in requirements = %d, %v", schemaDefaultCount, err)
 	}
 }
 

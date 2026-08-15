@@ -17,6 +17,8 @@ import (
 
 	"github.com/localenv/localenv/internal/config"
 	"github.com/localenv/localenv/internal/githubapp"
+	"github.com/localenv/localenv/internal/pranalysis"
+	"github.com/localenv/localenv/internal/store/sqlite"
 )
 
 const (
@@ -36,8 +38,18 @@ type webhookStore interface {
 	ProcessGitHubWebhook(context.Context, githubapp.WebhookEvent) (bool, error)
 }
 
+type webhookFailureStore interface {
+	MarkGitHubWebhookFailed(context.Context, string) error
+}
+
 type discoveryStore interface {
 	DiscoveredRepositories(context.Context) ([]githubapp.Repository, error)
+}
+
+type readinessPRStore interface {
+	SavePullRequestRequirements(context.Context, githubapp.PullRequest, []pranalysis.Requirement) (sqlite.PullRequestReadiness, error)
+	ClosePullRequest(context.Context, githubapp.PullRequest) error
+	SaveReadinessPublication(context.Context, int64, int, int64, int64) error
 }
 
 // Server holds dependencies for HTTP handlers.
@@ -312,13 +324,88 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "webhook processing failed", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
 	if duplicate {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"status":"duplicate"}\n`))
 		return
 	}
+	if event.PullRequest != nil {
+		if err := s.processPullRequest(r.Context(), credentials, event); err != nil {
+			if failures, ok := s.store.(webhookFailureStore); ok {
+				_ = failures.MarkGitHubWebhookFailed(r.Context(), event.DeliveryID)
+			}
+			http.Error(w, "pull request readiness processing failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"accepted"}\n`))
+}
+
+func (s *Server) processPullRequest(ctx context.Context, credentials githubapp.Credentials, event githubapp.WebhookEvent) error {
+	store, ok := s.store.(readinessPRStore)
+	if !ok || event.PullRequest == nil {
+		return nil
+	}
+	pull := *event.PullRequest
+	if pull.State == "closed" || pull.State == "merged" {
+		err := store.ClosePullRequest(ctx, pull)
+		if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+			return nil
+		}
+		return err
+	}
+	result, err := pranalysis.Analyze(ctx, s.github, credentials, event.InstallationID, pull)
+	if err != nil {
+		return err
+	}
+	readiness, err := store.SavePullRequestRequirements(ctx, pull, result.Requirements)
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	summary, comment, success := readinessText(result.Requirements, s.publicURL(fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(pull.Repository.Owner), url.PathEscape(pull.Repository.Name), pull.Number)))
+	publication, err := s.github.PublishReadiness(ctx, credentials, event.InstallationID, pull, githubapp.ReadinessPublication{CheckRunID: readiness.CheckRunID, CommentID: readiness.CommentID, Success: success, Summary: summary, Comment: comment})
+	if err != nil {
+		if publication.CheckRunID > 0 || publication.CommentID > 0 {
+			_ = store.SaveReadinessPublication(ctx, pull.Repository.GitHubRepoID, pull.Number, publication.CheckRunID, publication.CommentID)
+		}
+		return err
+	}
+	return store.SaveReadinessPublication(ctx, pull.Repository.GitHubRepoID, pull.Number, publication.CheckRunID, publication.CommentID)
+}
+
+func readinessText(requirements []pranalysis.Requirement, detailsURL string) (summary, comment string, success bool) {
+	missing := make([]string, 0)
+	for _, requirement := range requirements {
+		if requirement.State == pranalysis.StateMissing {
+			missing = append(missing, requirement.KeyName)
+		}
+	}
+	if len(missing) == 0 {
+		return "All newly required local environment variables are configured.", "local.env readiness is passing.\n\nAll newly required local environment variables are configured.\n\nDocumentation:\n" + detailsURL, true
+	}
+	lines := make([]string, 0, len(missing))
+	for _, key := range missing {
+		lines = append(lines, "- "+key)
+	}
+	summary = fmt.Sprintf("Environment readiness failed.\n\n%d local environment variable", len(missing))
+	if len(missing) != 1 {
+		summary += "s are"
+	} else {
+		summary += " is"
+	}
+	summary += " missing:\n\n" + strings.Join(lines, "\n") + "\n\nRun:\n\n  localenv resolve\n\nor:\n\n  localenv set " + missing[0]
+	comment = "local.env detected a new local environment dependency.\n\n"
+	for _, key := range missing {
+		comment += key + "    ❌ missing\n"
+	}
+	comment += "\nPR author: run\n\n    localenv resolve\n\nDocumentation:\n" + detailsURL
+	return summary, comment, false
 }
 
 func (s *Server) oauthCredentials() (string, string, bool) {

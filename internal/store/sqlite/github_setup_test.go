@@ -44,3 +44,21 @@ func TestProcessGitHubWebhookIsIdempotentAndDiscoversRepositories(t *testing.T) 
 		t.Errorf("webhook deliveries = %d, want 1", deliveries)
 	}
 }
+
+func TestFailedWebhookDeliveryCanBeRetried(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	event := githubapp.WebhookEvent{DeliveryID: "delivery-retry-1", EventType: "ping"}
+	if duplicate, err := store.ProcessGitHubWebhook(context.Background(), event); err != nil || duplicate {
+		t.Fatalf("initial ProcessGitHubWebhook() = (%v, %v), want (false, nil)", duplicate, err)
+	}
+	if err := store.MarkGitHubWebhookFailed(context.Background(), event.DeliveryID); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := store.ProcessGitHubWebhook(context.Background(), event); err != nil || duplicate {
+		t.Fatalf("retried ProcessGitHubWebhook() = (%v, %v), want (false, nil)", duplicate, err)
+	}
+}

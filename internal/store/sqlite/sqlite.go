@@ -15,11 +15,16 @@ import (
 	"time"
 
 	"github.com/localenv/localenv/internal/githubapp"
+	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/migrations"
 	_ "modernc.org/sqlite"
 )
 
 const databaseFile = "localenv.db"
+
+// ErrRepositoryNotManaged lets webhook handling safely ignore repositories
+// where local.env has not yet persisted a validated contract.
+var ErrRepositoryNotManaged = errors.New("repository is not managed")
 
 // Store owns a single SQLite connection. A single connection keeps connection
 // pragmas (notably foreign_keys) consistently enabled for this small v1 server.
@@ -238,7 +243,13 @@ func (s *Store) ProcessGitHubWebhook(ctx context.Context, event githubapp.Webhoo
 		return false, fmt.Errorf("inspect GitHub webhook delivery: %w", err)
 	}
 	if inserted == 0 {
-		return true, nil
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM webhook_deliveries WHERE github_delivery_id = ?`, event.DeliveryID).Scan(&status); err != nil {
+			return false, fmt.Errorf("read GitHub webhook delivery status: %w", err)
+		}
+		if status == "processed" {
+			return true, nil
+		}
 	}
 	if err := s.applyGitHubWebhook(ctx, tx, event); err != nil {
 		return false, err
@@ -250,6 +261,19 @@ func (s *Store) ProcessGitHubWebhook(ctx context.Context, event githubapp.Webhoo
 		return false, fmt.Errorf("commit GitHub webhook delivery: %w", err)
 	}
 	return false, nil
+}
+
+// MarkGitHubWebhookFailed preserves a retryable delivery when downstream PR
+// analysis or a GitHub Check/comment upsert fails after receipt.
+func (s *Store) MarkGitHubWebhookFailed(ctx context.Context, deliveryID string) error {
+	if strings.TrimSpace(deliveryID) == "" {
+		return errors.New("GitHub delivery ID must not be empty")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE webhook_deliveries SET processed_at = NULL, status = 'failed' WHERE github_delivery_id = ?`, deliveryID)
+	if err != nil {
+		return fmt.Errorf("mark GitHub webhook delivery failed: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) applyGitHubWebhook(ctx context.Context, tx *sql.Tx, event githubapp.WebhookEvent) error {
@@ -359,8 +383,8 @@ func (s *Store) SaveRepositoryConfigSnapshot(ctx context.Context, snapshot Repos
 	if _, err := tx.ExecContext(ctx, `DELETE FROM repo_files WHERE repository_id = ?`, repositoryID); err != nil {
 		return fmt.Errorf("clear repository file configuration: %w", err)
 	}
-	for index, file := range snapshot.Files {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO repo_files(id, repository_id, schema_path, target_path) VALUES (?, ?, ?, ?)`, fmt.Sprintf("%s:file:%d", repositoryID, index), repositoryID, file.SchemaPath, file.TargetPath); err != nil {
+	for _, file := range snapshot.Files {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO repo_files(id, repository_id, schema_path, target_path) VALUES (?, ?, ?, ?)`, pranalysis.FileID(snapshot.GitHubRepoID, file.SchemaPath, file.TargetPath), repositoryID, file.SchemaPath, file.TargetPath); err != nil {
 			return fmt.Errorf("store repository file configuration: %w", err)
 		}
 	}
@@ -368,6 +392,151 @@ func (s *Store) SaveRepositoryConfigSnapshot(ctx context.Context, snapshot Repos
 		return fmt.Errorf("commit repository configuration snapshot: %w", err)
 	}
 	return nil
+}
+
+// PullRequestReadiness is the ciphertext-free PR state used to publish a
+// readiness check. It intentionally contains key names only.
+type PullRequestReadiness struct {
+	PullRequest  githubapp.PullRequest
+	Requirements []pranalysis.Requirement
+	CheckRunID   int64
+	CommentID    int64
+}
+
+// SavePullRequestRequirements atomically replaces a PR's requirements using a
+// completed base/head analysis. Existing Check Run and comment identifiers are
+// retained so GitHub artifacts are updated instead of duplicated.
+func (s *Store) SavePullRequestRequirements(ctx context.Context, pull githubapp.PullRequest, requirements []pranalysis.Requirement) (PullRequestReadiness, error) {
+	repositoryID, err := s.repositoryID(ctx, pull.Repository.GitHubRepoID)
+	if err != nil {
+		return PullRequestReadiness{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("begin PR requirements: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pull_requests(repository_id, pr_number, head_sha, base_sha, author_github_user_id, state, merged_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repository_id, pr_number) DO UPDATE SET
+			head_sha = excluded.head_sha,
+			base_sha = excluded.base_sha,
+			author_github_user_id = excluded.author_github_user_id,
+			state = excluded.state,
+			merged_at = excluded.merged_at,
+			updated_at = excluded.updated_at`, repositoryID, pull.Number, pull.HeadSHA, pull.BaseSHA, pull.AuthorID, pull.State, pull.MergedAt, time.Now().UTC()); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("store pull request: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pr_requirements WHERE repository_id = ? AND pr_number = ?`, repositoryID, pull.Number); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("clear PR requirements: %w", err)
+	}
+	for _, requirement := range requirements {
+		if !validRequirement(requirement) {
+			return PullRequestReadiness{}, errors.New("invalid PR requirement")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pr_requirements(repository_id, pr_number, file_id, key_name, requirement_state) VALUES (?, ?, ?, ?, ?)`, repositoryID, pull.Number, requirement.FileID, requirement.KeyName, requirement.State); err != nil {
+			return PullRequestReadiness{}, fmt.Errorf("store PR requirement: %w", err)
+		}
+	}
+	var result PullRequestReadiness
+	result.PullRequest = pull
+	result.Requirements = append([]pranalysis.Requirement(nil), requirements...)
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(github_check_run_id, 0), COALESCE(github_comment_id, 0) FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, pull.Number).Scan(&result.CheckRunID, &result.CommentID); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("read PR publication identifiers: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("commit PR requirements: %w", err)
+	}
+	return result, nil
+}
+
+// ClosePullRequest records GitHub's terminal PR state. There are no pending
+// secrets in P3, so it never promotes, archives, or deletes secret data.
+func (s *Store) ClosePullRequest(ctx context.Context, pull githubapp.PullRequest) error {
+	repositoryID, err := s.repositoryID(ctx, pull.Repository.GitHubRepoID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO pull_requests(repository_id, pr_number, head_sha, base_sha, author_github_user_id, state, merged_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repository_id, pr_number) DO UPDATE SET
+			head_sha = excluded.head_sha,
+			base_sha = excluded.base_sha,
+			author_github_user_id = excluded.author_github_user_id,
+			state = excluded.state,
+			merged_at = excluded.merged_at,
+			updated_at = excluded.updated_at`, repositoryID, pull.Number, pull.HeadSHA, pull.BaseSHA, pull.AuthorID, pull.State, pull.MergedAt, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("close pull request: %w", err)
+	}
+	return nil
+}
+
+// SaveReadinessPublication records the remote Check Run/comment identities
+// only after GitHub accepts the upsert response.
+func (s *Store) SaveReadinessPublication(ctx context.Context, githubRepositoryID int64, number int, checkRunID, commentID int64) error {
+	repositoryID, err := s.repositoryID(ctx, githubRepositoryID)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE pull_requests SET github_check_run_id = CASE WHEN ? > 0 THEN ? ELSE github_check_run_id END, github_comment_id = CASE WHEN ? > 0 THEN ? ELSE github_comment_id END, updated_at = ? WHERE repository_id = ? AND pr_number = ?`, checkRunID, checkRunID, commentID, commentID, time.Now().UTC(), repositoryID, number)
+	if err != nil {
+		return fmt.Errorf("save PR publication identifiers: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.New("pull request not found while saving publication identifiers")
+	}
+	return nil
+}
+
+// PullRequestRequirements returns the last persisted public readiness states.
+// It exists for future authenticated API/UI handlers and cannot expose values.
+func (s *Store) PullRequestRequirements(ctx context.Context, githubRepositoryID int64, number int) ([]pranalysis.Requirement, error) {
+	repositoryID, err := s.repositoryID(ctx, githubRepositoryID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT file_id, key_name, requirement_state FROM pr_requirements WHERE repository_id = ? AND pr_number = ? ORDER BY key_name, file_id`, repositoryID, number)
+	if err != nil {
+		return nil, fmt.Errorf("list PR requirements: %w", err)
+	}
+	defer rows.Close()
+	var requirements []pranalysis.Requirement
+	for rows.Next() {
+		var requirement pranalysis.Requirement
+		if err := rows.Scan(&requirement.FileID, &requirement.KeyName, &requirement.State); err != nil {
+			return nil, fmt.Errorf("scan PR requirement: %w", err)
+		}
+		requirements = append(requirements, requirement)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate PR requirements: %w", err)
+	}
+	return requirements, nil
+}
+
+func (s *Store) repositoryID(ctx context.Context, githubRepositoryID int64) (string, error) {
+	if githubRepositoryID <= 0 {
+		return "", ErrRepositoryNotManaged
+	}
+	var repositoryID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE github_repo_id = ?`, githubRepositoryID).Scan(&repositoryID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrRepositoryNotManaged
+	}
+	if err != nil {
+		return "", fmt.Errorf("find managed repository: %w", err)
+	}
+	return repositoryID, nil
+}
+
+func validRequirement(requirement pranalysis.Requirement) bool {
+	if requirement.FileID == "" || requirement.KeyName == "" {
+		return false
+	}
+	return requirement.State == pranalysis.StateMissing || requirement.State == pranalysis.StateReady || requirement.State == pranalysis.StateRemoved
 }
 
 // RepositoryConfigSnapshot returns the last validated contract for a managed
