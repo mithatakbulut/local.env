@@ -661,7 +661,7 @@ func clearSnapshot(snapshot decryptedSnapshot) {
 }
 
 func runImport(args []string, out, errOut io.Writer) int {
-	args = normalizeImportArgs(args)
+	args = normalizeSingleArgumentFirst(args)
 	flags := flag.NewFlagSet("import", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
@@ -771,10 +771,11 @@ func runImport(args []string, out, errOut io.Writer) int {
 	return 0
 }
 
-// normalizeImportArgs preserves the documented `localenv import FILE
-// [flags]` spelling while also accepting the standard Go flag spelling with
-// FILE last. The flag package stops parsing at the first positional argument.
-func normalizeImportArgs(args []string) []string {
+// normalizeSingleArgumentFirst preserves documented command forms such as
+// `localenv import FILE [flags]` and `localenv set KEY [flags]` while also
+// accepting the standard Go flag spelling with the positional argument last.
+// The flag package otherwise stops parsing at the first positional argument.
+func normalizeSingleArgumentFirst(args []string) []string {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		return args
 	}
@@ -881,6 +882,7 @@ func runResolve(args []string, out, errOut io.Writer) int {
 }
 
 func runSet(args []string, out, errOut io.Writer) int {
+	args = normalizeSingleArgumentFirst(args)
 	flags := flag.NewFlagSet("set", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	pr := flags.Int("pr", 0, "pull request number")

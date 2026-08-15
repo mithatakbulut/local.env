@@ -203,11 +203,16 @@ func TestDeviceIdentityUsesDeviceRegistrationPayloadNames(t *testing.T) {
 	}
 }
 
-func TestNormalizeImportArgsAcceptsDocumentedFileFirstSyntax(t *testing.T) {
-	got := normalizeImportArgs([]string{".env.local", "--instance", "https://env.example.test", "--repo", "acme/api"})
+func TestNormalizeSingleArgumentFirstAcceptsDocumentedSyntax(t *testing.T) {
+	got := normalizeSingleArgumentFirst([]string{".env.local", "--instance", "https://env.example.test", "--repo", "acme/api"})
 	want := []string{"--instance", "https://env.example.test", "--repo", "acme/api", ".env.local"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized arguments = %#v, want %#v", got, want)
+	}
+	got = normalizeSingleArgumentFirst([]string{"REDIS_URL", "--pr", "1"})
+	want = []string{"--pr", "1", "REDIS_URL"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized set arguments = %#v, want %#v", got, want)
 	}
 }
 
