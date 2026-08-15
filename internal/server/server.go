@@ -64,6 +64,11 @@ type cliAuthStore interface {
 	RevokeSession(context.Context, string) error
 }
 
+type repositoryCryptoStore interface {
+	RepositoryCryptoState(context.Context, string, string) (sqlite.RepositoryCryptoState, error)
+	InitializeRepositoryCrypto(context.Context, string, string, int64, string, []byte) (sqlite.RepositoryCryptoState, error)
+}
+
 // Server holds dependencies for HTTP handlers.
 type Server struct {
 	config      config.Config
@@ -99,6 +104,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/me", s.me)
 	mux.HandleFunc("POST /api/v1/devices", s.registerDevice)
 	mux.HandleFunc("GET /api/v1/devices", s.devices)
+	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}", s.repositoryCryptoState)
+	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/init", s.initializeRepositoryCrypto)
 	mux.HandleFunc("POST /api/v1/github/webhook", s.githubWebhook)
 	return mux
 }
@@ -400,6 +407,94 @@ func (s *Server) cliLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// repositoryCryptoState returns only public repository/crypto metadata after
+// the caller's current GitHub write access has been checked. Wrapped keys are
+// intentionally introduced only by the later snapshot flow.
+func (s *Server) repositoryCryptoState(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository bootstrap persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := store.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository bootstrap is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if authenticated.Device.ID == "" || !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+// initializeRepositoryCrypto accepts an age-wrapped 32-byte REK generated on
+// the client. It neither accepts nor constructs a plaintext repository key.
+func (s *Server) initializeRepositoryCrypto(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository bootstrap persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := store.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository bootstrap is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if authenticated.Device.ID == "" || !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	var request struct {
+		WrappedREK []byte `json:"wrapped_rek"`
+	}
+	if !decodeRequestJSON(w, r, &request) {
+		return
+	}
+	initialized, err := store.InitializeRepositoryCrypto(r.Context(), state.Owner, state.Name, authenticated.User.ID, authenticated.Device.ID, request.WrappedREK)
+	if errors.Is(err, sqlite.ErrRepositoryAlreadyInitialized) {
+		http.Error(w, "repository encryption is already initialized", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository encryption bootstrap failed", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusCreated, initialized)
+}
+
+func (s *Server) authorizeRepository(w http.ResponseWriter, r *http.Request, state sqlite.RepositoryCryptoState, user githubapp.User) bool {
+	credentials, configured, err := s.credentials.Load()
+	if err != nil || !configured {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	allowed, err := s.github.HasRepositoryWriteAccess(r.Context(), credentials, state.InstallationID, state.Owner, state.Name, user.Login)
+	if err != nil {
+		http.Error(w, "repository authorization is unavailable", http.StatusBadGateway)
+		return false
+	}
+	if !allowed {
+		http.Error(w, "repository access is required", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (sqlite.AuthenticatedSession, string, bool) {

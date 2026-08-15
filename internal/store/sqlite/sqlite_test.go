@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/localenv/localenv/internal/cryptokit"
 	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/migrations"
@@ -212,5 +214,62 @@ func TestRepositoryConfigSnapshotRejectsEscapingPath(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("SaveRepositoryConfigSnapshot() accepted escaping path")
+	}
+}
+
+func TestRepositoryCryptoBootstrapStoresOnlyWrappedREK(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	if err := store.ConfigureGitHubInstance(ctx, 2, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(ctx, RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installations(github_installation_id, created_at) VALUES (7, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installation_repositories(github_repo_id, github_installation_id, owner, name, default_branch, active, updated_at) VALUES (17, 7, 'acme', 'api', 'main', 1, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	user := githubapp.User{ID: 41, Login: "developer"}
+	if err := store.CreateSession(ctx, user, "non-secret-test-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.RegisterDevice(ctx, "non-secret-test-session", "device-test-id", "test-device", identity.Recipient().String(), "sha256:0000000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This explicit non-secret sentinel is a stand-in for the client-only REK;
+	// the assertion below proves it never reaches SQLite in plaintext.
+	rek := []byte("non-secret-test-rek-sentinel-000")
+	if len(rek) != cryptokit.REKSize {
+		t.Fatalf("test REK length = %d", len(rek))
+	}
+	wrapped, err := cryptokit.WrapREK(rek, identity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.InitializeRepositoryCrypto(ctx, "acme", "api", user.ID, device.ID, wrapped)
+	if err != nil || !state.Initialized || state.ActiveKeyEpoch != 1 || state.InstanceID == "" {
+		t.Fatalf("InitializeRepositoryCrypto() = %#v, %v", state, err)
+	}
+	var storedWrapped string
+	if err := store.db.QueryRow(`SELECT CAST(wrapped_key AS TEXT) FROM wrapped_repo_keys WHERE repository_id = 'github:17' AND epoch = 1 AND device_id = ?`, device.ID).Scan(&storedWrapped); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(storedWrapped, string(rek)) {
+		t.Fatal("plaintext repository key was persisted")
+	}
+	if _, err := store.InitializeRepositoryCrypto(ctx, "acme", "api", user.ID, device.ID, wrapped); !errors.Is(err, ErrRepositoryAlreadyInitialized) {
+		t.Fatalf("second bootstrap error = %v, want already initialized", err)
 	}
 }

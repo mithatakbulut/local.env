@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -18,9 +19,11 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 	"github.com/localenv/localenv/internal/config"
+	"github.com/localenv/localenv/internal/cryptokit"
 	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/store/sqlite"
 )
@@ -119,6 +122,95 @@ func TestCLIAuthenticationExchangesOneTimeCodeRegistersDeviceAndRevokesSession(t
 	app.Handler().ServeHTTP(after, meRequest)
 	if after.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked session me = %d, want 401", after.Code)
+	}
+}
+
+func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}))
+	permission := "write"
+	fakeGitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/7/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
+		case "/repos/acme/api/collaborators/developer/permission":
+			_, _ = w.Write([]byte(`{"permission":"` + permission + `"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fakeGitHub.Close)
+	store, err := sqlite.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	if err := store.ConfigureGitHubInstance(ctx, 2, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(ctx, sqlite.RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []sqlite.RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ProcessGitHubWebhook(ctx, githubapp.WebhookEvent{DeliveryID: "installation-1", EventType: "installation", InstallationID: 7, InstallationOrgID: 2, InstallationOrgLogin: "acme", RepositoriesAdded: []githubapp.Repository{{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main"}}}); err != nil {
+		t.Fatal(err)
+	}
+	user := githubapp.User{ID: 31, Login: "developer"}
+	token := "non-secret-test-session"
+	if err := store.CreateSession(ctx, user, token, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterDevice(ctx, token, "device-1", "laptop", identity.Recipient().String(), "sha256:0000000000000000"); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	app := NewWithGitHubClient(config.Config{DataDir: dataDir, PublicURL: mustURL(t, "https://env.example.test"), GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: fakeGitHub.Client(), APIBaseURL: fakeGitHub.URL})
+	if err := app.credentials.Save(githubapp.Credentials{AppID: 9, ClientID: "test-client", ClientSecret: "test-client-secret", PrivateKeyPEM: pemKey, WebhookSecret: "test-webhook-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	get := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api", nil)
+	get.Header.Set("Authorization", "Bearer "+token)
+	getRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(getRecorder, get)
+	if getRecorder.Code != http.StatusOK || strings.Contains(getRecorder.Body.String(), "wrapped") {
+		t.Fatalf("bootstrap state = %d, %s", getRecorder.Code, getRecorder.Body.String())
+	}
+	// The sentinel is client-only REK material; only its age-wrapped form is
+	// sent to the server. SQLite storage is checked in the store test.
+	rek := []byte("non-secret-test-rek-sentinel-000")
+	wrapped, err := cryptokit.WrapREK(rek, identity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(struct {
+		WrappedREK []byte `json:"wrapped_rek"`
+	}{wrapped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := httptest.NewRequest(http.MethodPost, "/api/v1/repos/acme/api/init", bytes.NewReader(payload))
+	post.Header.Set("Content-Type", "application/json")
+	post.Header.Set("Authorization", "Bearer "+token)
+	postRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(postRecorder, post)
+	if postRecorder.Code != http.StatusCreated || strings.Contains(postRecorder.Body.String(), string(rek)) {
+		t.Fatalf("bootstrap init = %d, %s", postRecorder.Code, postRecorder.Body.String())
+	}
+	permission = "read"
+	denied := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api", nil)
+	denied.Header.Set("Authorization", "Bearer "+token)
+	deniedRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(deniedRecorder, denied)
+	if deniedRecorder.Code != http.StatusForbidden {
+		t.Fatalf("read-only GitHub permission bootstrap state = %d, want 403", deniedRecorder.Code)
 	}
 }
 

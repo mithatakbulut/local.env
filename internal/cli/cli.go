@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/localenv/localenv/internal/cryptokit"
 	"github.com/localenv/localenv/internal/repository"
 	"github.com/zalando/go-keyring"
 )
@@ -44,6 +45,8 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runStatus(args[1:], out, errOut)
 	case "logout":
 		return runLogout(args[1:], out, errOut)
+	case "repo":
+		return runRepo(args[1:], out, errOut)
 	case "--version", "version":
 		return 0
 	case "--help", "help":
@@ -62,6 +65,7 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  login <instance-url>  Sign in with GitHub and register this device")
 	fmt.Fprintln(out, "  status                Show signed-in user, repository, and device")
 	fmt.Fprintln(out, "  logout                Revoke and remove the local session")
+	fmt.Fprintln(out, "  repo init             Initialize client-side repository encryption")
 }
 
 func runLogin(args []string, out, errOut io.Writer) int {
@@ -227,6 +231,116 @@ func runLogout(args []string, out, errOut io.Writer) int {
 	return 0
 }
 
+func runRepo(args []string, out, errOut io.Writer) int {
+	if len(args) == 0 || args[0] != "init" {
+		fmt.Fprintln(errOut, "Usage: localenv repo init [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	flags := flag.NewFlagSet("repo init", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+		fmt.Fprintln(errOut, "Usage: localenv repo init [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: credential storage is unavailable")
+		return 1
+	}
+	instance, token, err := currentSession(secrets, *instanceFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: not signed in; run localenv login <instance-url>")
+		return 1
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: this machine has no registered device identity; run localenv login again")
+		return 1
+	}
+	owner, name, err := selectedRepository(*repositoryFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository was not detected; pass --repo owner/name")
+		return 1
+	}
+	endpoint := instance + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name)
+	var state apiRepositoryCryptoState
+	if err := requestJSON(context.Background(), http.MethodGet, endpoint, token, nil, &state); err != nil {
+		fmt.Fprintln(errOut, "localenv: repository access is unavailable or you do not have GitHub write access")
+		return 1
+	}
+	if state.Initialized || state.ActiveKeyEpoch != 0 {
+		fmt.Fprintln(errOut, "localenv: repository encryption is already initialized")
+		return 1
+	}
+	rek, err := cryptokit.GenerateREK()
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not generate repository encryption key")
+		return 1
+	}
+	defer clear(rek)
+	wrapped, err := cryptokit.WrapREK(rek, identity.Recipient)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not wrap repository encryption key")
+		return 1
+	}
+	if err := requestJSON(context.Background(), http.MethodPost, endpoint+"/init", token, struct {
+		WrappedREK []byte `json:"wrapped_rek"`
+	}{WrappedREK: wrapped}, &state); err != nil {
+		fmt.Fprintln(errOut, "localenv: repository encryption initialization failed")
+		return 1
+	}
+	if state.ActiveKeyEpoch != 1 || !state.Initialized {
+		fmt.Fprintln(errOut, "localenv: repository encryption initialization failed")
+		return 1
+	}
+	fmt.Fprintf(out, "Repository encryption initialized for %s/%s (epoch 1).\n", state.Owner, state.Name)
+	return 0
+}
+
+func currentSession(secrets secretStore, instanceFlag string) (string, string, error) {
+	instanceRaw := instanceFlag
+	var err error
+	if instanceRaw == "" {
+		instanceRaw, err = secrets.Get("last-instance")
+		if err != nil {
+			return "", "", err
+		}
+	}
+	instance, err := normalizeInstance(instanceRaw)
+	if err != nil {
+		return "", "", err
+	}
+	token, err := secrets.Get(sessionKey(instance))
+	if err != nil || token == "" {
+		return "", "", errors.New("session not found")
+	}
+	return instance, token, nil
+}
+
+func selectedRepository(raw string) (string, string, error) {
+	if raw != "" {
+		owner, name, found := strings.Cut(raw, "/")
+		if !found || owner == "" || name == "" || strings.ContainsAny(owner, "/\\\x00") || strings.ContainsAny(name, "/\\\x00") {
+			return "", "", errors.New("invalid repository")
+		}
+		return owner, name, nil
+	}
+	identity, err := repository.Detect(context.Background(), ".")
+	if err != nil {
+		return "", "", err
+	}
+	return identity.Owner, identity.Name, nil
+}
+
+func clear(value []byte) {
+	for i := range value {
+		value[i] = 0
+	}
+}
+
 type secretStore interface {
 	Get(string) (string, error)
 	Set(string, string) error
@@ -321,23 +435,15 @@ func (s *fileStore) Delete(key string) error {
 	return s.write(values)
 }
 
-type deviceIdentity struct{ ID, Name, Recipient, Fingerprint string }
+type deviceIdentity struct {
+	ID, Name, Recipient, Fingerprint string
+}
 
 func loadOrCreateIdentity(store secretStore, instance string) (deviceIdentity, error) {
-	key := identityKey(instance)
-	if raw, err := store.Get(key); err == nil {
-		var saved struct {
-			ID       string `json:"id"`
-			Name     string `json:"name"`
-			Identity string `json:"identity"`
-		}
-		if json.Unmarshal([]byte(raw), &saved) == nil && saved.ID != "" && saved.Name != "" {
-			identity, err := age.ParseX25519Identity(saved.Identity)
-			if err == nil {
-				return identityFrom(saved.ID, saved.Name, identity), nil
-			}
-		}
-		return deviceIdentity{}, errors.New("stored device identity is invalid")
+	if identity, err := loadIdentity(store, instance); err == nil {
+		return identity, nil
+	} else if !errors.Is(err, keyring.ErrNotFound) {
+		return deviceIdentity{}, err
 	}
 	identity, err := age.GenerateX25519Identity()
 	if err != nil {
@@ -356,7 +462,7 @@ func loadOrCreateIdentity(store secretStore, instance string) (deviceIdentity, e
 		Name     string `json:"name"`
 		Identity string `json:"identity"`
 	}{id, name, identity.String()})
-	if err := store.Set(key, string(saved)); err != nil {
+	if err := store.Set(identityKey(instance), string(saved)); err != nil {
 		return deviceIdentity{}, err
 	}
 	return identityFrom(id, name, identity), nil
@@ -365,6 +471,26 @@ func identityFrom(id, name string, identity *age.X25519Identity) deviceIdentity 
 	recipient := identity.Recipient().String()
 	sum := sha256.Sum256([]byte(recipient))
 	return deviceIdentity{ID: id, Name: name, Recipient: recipient, Fingerprint: "sha256:" + hex.EncodeToString(sum[:8])}
+}
+
+func loadIdentity(store secretStore, instance string) (deviceIdentity, error) {
+	raw, err := store.Get(identityKey(instance))
+	if err != nil {
+		return deviceIdentity{}, err
+	}
+	var saved struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Identity string `json:"identity"`
+	}
+	if json.Unmarshal([]byte(raw), &saved) != nil || saved.ID == "" || saved.Name == "" {
+		return deviceIdentity{}, errors.New("stored device identity is invalid")
+	}
+	identity, err := age.ParseX25519Identity(saved.Identity)
+	if err != nil {
+		return deviceIdentity{}, errors.New("stored device identity is invalid")
+	}
+	return identityFrom(saved.ID, saved.Name, identity), nil
 }
 func randomID() (string, error) {
 	bytes := make([]byte, 16)
@@ -394,6 +520,15 @@ type apiMe struct {
 		Login string `json:"login"`
 	} `json:"user"`
 	Device apiDevice `json:"device"`
+}
+
+type apiRepositoryCryptoState struct {
+	InstanceID     string `json:"instance_id"`
+	GitHubRepoID   int64  `json:"github_repo_id"`
+	Owner          string `json:"owner"`
+	Name           string `json:"name"`
+	ActiveKeyEpoch int64  `json:"active_key_epoch"`
+	Initialized    bool   `json:"initialized"`
 }
 
 func exchange(ctx context.Context, instance, code string) (apiSession, error) {

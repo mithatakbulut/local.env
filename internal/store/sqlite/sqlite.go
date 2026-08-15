@@ -3,10 +3,12 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -25,7 +27,10 @@ const databaseFile = "localenv.db"
 
 // ErrRepositoryNotManaged lets webhook handling safely ignore repositories
 // where local.env has not yet persisted a validated contract.
-var ErrRepositoryNotManaged = errors.New("repository is not managed")
+var (
+	ErrRepositoryNotManaged         = errors.New("repository is not managed")
+	ErrRepositoryAlreadyInitialized = errors.New("repository encryption is already initialized")
+)
 
 // Store owns a single SQLite connection. A single connection keeps connection
 // pragmas (notably foreign_keys) consistently enabled for this small v1 server.
@@ -50,6 +55,19 @@ type Device struct {
 	Fingerprint     string    `json:"fingerprint"`
 	CreatedAt       time.Time `json:"created_at"`
 	LastSeenAt      time.Time `json:"last_seen_at"`
+}
+
+// RepositoryCryptoState is the non-secret bootstrap metadata a client needs
+// to construct canonical AAD and initialize an uninitialized repository. It
+// deliberately has no repository key or wrapped-key field.
+type RepositoryCryptoState struct {
+	InstanceID     string `json:"instance_id"`
+	GitHubRepoID   int64  `json:"github_repo_id"`
+	Owner          string `json:"owner"`
+	Name           string `json:"name"`
+	ActiveKeyEpoch int64  `json:"active_key_epoch"`
+	InstallationID int64  `json:"-"`
+	Initialized    bool   `json:"initialized"`
 }
 
 // CreateAuthExchange records a one-time, short-lived CLI exchange code by
@@ -392,16 +410,21 @@ func (s *Store) ConfigureGitHubInstance(ctx context.Context, organizationID int6
 	if organizationID <= 0 || strings.TrimSpace(organizationLogin) == "" || appID <= 0 {
 		return errors.New("incomplete GitHub instance configuration")
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO instance(id, github_org_id, github_org_login, github_app_id, public_url, display_name, created_at)
-		VALUES ('singleton', ?, ?, ?, ?, ?, ?)
+	cryptoInstanceID, err := newUUID()
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO instance(id, github_org_id, github_org_login, github_app_id, public_url, display_name, crypto_instance_id, created_at)
+		VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			github_org_id = excluded.github_org_id,
 			github_org_login = excluded.github_org_login,
 			github_app_id = excluded.github_app_id,
 			public_url = excluded.public_url,
-			display_name = excluded.display_name`,
-		organizationID, organizationLogin, appID, publicURL, displayName, time.Now().UTC())
+			display_name = excluded.display_name,
+			crypto_instance_id = CASE WHEN instance.crypto_instance_id = '' THEN excluded.crypto_instance_id ELSE instance.crypto_instance_id END`,
+		organizationID, organizationLogin, appID, publicURL, displayName, cryptoInstanceID, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("store GitHub instance configuration: %w", err)
 	}
@@ -727,6 +750,145 @@ func (s *Store) repositoryID(ctx context.Context, githubRepositoryID int64) (str
 		return "", fmt.Errorf("find managed repository: %w", err)
 	}
 	return repositoryID, nil
+}
+
+// RepositoryCryptoState returns only bootstrap metadata for a repository
+// covered by the current GitHub App installation. Callers must still perform
+// a current GitHub permission check before returning it to a user.
+func (s *Store) RepositoryCryptoState(ctx context.Context, owner, name string) (RepositoryCryptoState, error) {
+	if !validRepositoryName(owner) || !validRepositoryName(name) {
+		return RepositoryCryptoState{}, ErrRepositoryNotManaged
+	}
+	var state RepositoryCryptoState
+	err := s.db.QueryRowContext(ctx, `
+		SELECT i.crypto_instance_id, r.github_repo_id, r.owner, r.name,
+		       r.active_key_epoch, gir.github_installation_id
+		FROM repositories r
+		JOIN instance i ON i.id = 'singleton'
+		JOIN github_installation_repositories gir
+		  ON gir.github_repo_id = r.github_repo_id AND gir.active = 1
+		WHERE r.owner = ? AND r.name = ?`, owner, name).Scan(
+		&state.InstanceID, &state.GitHubRepoID, &state.Owner, &state.Name,
+		&state.ActiveKeyEpoch, &state.InstallationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RepositoryCryptoState{}, ErrRepositoryNotManaged
+	}
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("read repository crypto state: %w", err)
+	}
+	if state.InstanceID == "" {
+		instanceID, err := s.ensureCryptoInstanceID(ctx)
+		if err != nil {
+			return RepositoryCryptoState{}, err
+		}
+		state.InstanceID = instanceID
+	}
+	state.Initialized = state.ActiveKeyEpoch > 0
+	return state, nil
+}
+
+// InitializeRepositoryCrypto atomically creates epoch 1 and persists one
+// device-wrapped REK. The server receives only the opaque age ciphertext.
+func (s *Store) InitializeRepositoryCrypto(ctx context.Context, owner, name string, githubUserID int64, deviceID string, wrappedREK []byte) (RepositoryCryptoState, error) {
+	if !validRepositoryName(owner) || !validRepositoryName(name) || githubUserID <= 0 || deviceID == "" || len(wrappedREK) == 0 || len(wrappedREK) > 64<<10 {
+		return RepositoryCryptoState{}, errors.New("invalid repository encryption bootstrap")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("begin repository encryption bootstrap: %w", err)
+	}
+	defer tx.Rollback()
+	var repositoryID string
+	var state RepositoryCryptoState
+	err = tx.QueryRowContext(ctx, `
+		SELECT r.id, i.crypto_instance_id, r.github_repo_id, r.owner, r.name,
+		       r.active_key_epoch, gir.github_installation_id
+		FROM repositories r
+		JOIN instance i ON i.id = 'singleton'
+		JOIN github_installation_repositories gir
+		  ON gir.github_repo_id = r.github_repo_id AND gir.active = 1
+		WHERE r.owner = ? AND r.name = ?`, owner, name).Scan(
+		&repositoryID, &state.InstanceID, &state.GitHubRepoID, &state.Owner,
+		&state.Name, &state.ActiveKeyEpoch, &state.InstallationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RepositoryCryptoState{}, ErrRepositoryNotManaged
+	}
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("read repository encryption bootstrap: %w", err)
+	}
+	if state.ActiveKeyEpoch != 0 {
+		return RepositoryCryptoState{}, ErrRepositoryAlreadyInitialized
+	}
+	var activeDevice string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM devices WHERE id = ? AND github_user_id = ? AND revoked_at IS NULL`, deviceID, githubUserID).Scan(&activeDevice)
+	if err != nil || activeDevice != deviceID {
+		return RepositoryCryptoState{}, errors.New("active device is required for repository encryption bootstrap")
+	}
+	if state.InstanceID == "" {
+		state.InstanceID, err = newUUID()
+		if err != nil {
+			return RepositoryCryptoState{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE instance SET crypto_instance_id = ? WHERE id = 'singleton' AND crypto_instance_id = ''`, state.InstanceID); err != nil {
+			return RepositoryCryptoState{}, fmt.Errorf("set instance cryptographic identity: %w", err)
+		}
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_key_epochs(repository_id, epoch, status, created_at, retired_at) VALUES (?, 1, 'active', ?, NULL)`, repositoryID, now); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("store repository key epoch: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wrapped_repo_keys(repository_id, epoch, device_id, wrapped_key, created_at) VALUES (?, 1, ?, ?, ?)`, repositoryID, deviceID, wrappedREK, now); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("store wrapped repository key: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE repositories SET active_key_epoch = 1 WHERE id = ? AND active_key_epoch = 0`, repositoryID)
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("activate repository key epoch: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return RepositoryCryptoState{}, ErrRepositoryAlreadyInitialized
+	}
+	if err := tx.Commit(); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("commit repository encryption bootstrap: %w", err)
+	}
+	state.ActiveKeyEpoch = 1
+	state.Initialized = true
+	return state, nil
+}
+
+func validRepositoryName(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value && len(value) <= 255 && !strings.ContainsAny(value, "/\\\x00")
+}
+
+func newUUID() (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, bytes); err != nil {
+		return "", fmt.Errorf("generate instance cryptographic identity: %w", err)
+	}
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16]), nil
+}
+
+func (s *Store) ensureCryptoInstanceID(ctx context.Context) (string, error) {
+	var existing string
+	err := s.db.QueryRowContext(ctx, `SELECT crypto_instance_id FROM instance WHERE id = 'singleton'`).Scan(&existing)
+	if err != nil {
+		return "", errors.New("instance cryptographic identity is not initialized")
+	}
+	if existing != "" {
+		return existing, nil
+	}
+	generated, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE instance SET crypto_instance_id = ? WHERE id = 'singleton' AND crypto_instance_id = ''`, generated); err != nil {
+		return "", fmt.Errorf("set instance cryptographic identity: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT crypto_instance_id FROM instance WHERE id = 'singleton'`).Scan(&existing); err != nil || existing == "" {
+		return "", errors.New("instance cryptographic identity is not initialized")
+	}
+	return existing, nil
 }
 
 func validRequirement(requirement pranalysis.Requirement) bool {

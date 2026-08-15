@@ -226,6 +226,42 @@ func (c Client) ReadFile(ctx context.Context, credentials Credentials, installat
 	return contents, nil
 }
 
+// HasRepositoryWriteAccess verifies the currently authenticated GitHub user
+// still has a write-capable permission through the repository installation.
+// The OAuth token is never persisted or needed for this check.
+func (c Client) HasRepositoryWriteAccess(ctx context.Context, credentials Credentials, installationID int64, owner, repository, login string) (bool, error) {
+	if installationID <= 0 || !validGitHubLogin(owner) || !validGitHubLogin(repository) || !validGitHubLogin(login) {
+		return false, errors.New("incomplete repository permission request")
+	}
+	token, err := c.installationToken(ctx, credentials, installationID)
+	if err != nil {
+		return false, err
+	}
+	endpoint := c.apiURL("repos", owner, repository, "collaborators", login, "permission")
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	response, err := c.authorized(request, token)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("GitHub repository permission request returned status %d", response.StatusCode)
+	}
+	var result struct {
+		Permission string `json:"permission"`
+	}
+	if err := decodeJSON(response.Body, &result); err != nil {
+		return false, errors.New("decode GitHub repository permission")
+	}
+	return result.Permission == "admin" || result.Permission == "maintain" || result.Permission == "write", nil
+}
+
 // ReadinessPublication identifies the remote artifacts that must be updated,
 // rather than recreated, for a PR.
 type ReadinessPublication struct {
