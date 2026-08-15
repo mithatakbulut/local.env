@@ -91,12 +91,12 @@ func TestDashboardOperationalViewsUseOnlyAllowlistedMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	auditBody := string(encodedAudit)
-	for _, want := range []string{`"kind":"audit"`, `"event_type":"device.revoked"`, `"target_device_id"`} {
+	for _, want := range []string{`"kind":"audit"`, `"event_type":"device.revoked"`, `"key":"target_device_id"`, `"value":"device-d4"`} {
 		if !strings.Contains(auditBody, want) {
 			t.Errorf("audit view missing %q: %s", want, auditBody)
 		}
 	}
-	for _, forbidden := range []string{"private-user-id", "private-repository-id", "ciphertext", "secret_value"} {
+	for _, forbidden := range []string{"private-user-id", "private-repository-id", "ciphertext", "secret_value", `"Key":`, `"Value":`} {
 		if strings.Contains(auditBody, forbidden) {
 			t.Errorf("audit view exposed forbidden data %q: %s", forbidden, auditBody)
 		}
