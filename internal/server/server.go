@@ -139,6 +139,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /setup", s.setup)
 	mux.HandleFunc("GET /assets/{path...}", s.dashboardAsset)
 	mux.HandleFunc("GET /login", s.dashboardLogin)
+	mux.HandleFunc("POST /logout", s.dashboardLogout)
 	mux.HandleFunc("GET /repos", s.dashboardRepositories)
 	mux.HandleFunc("GET /repos/{owner}/{repo}", s.dashboardRepository)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", s.dashboardPullRequest)
@@ -665,7 +666,7 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GitHub account "+user.Login+" does not have write access to every configured repository", http.StatusForbidden)
 			return
 		}
-		session := dashboardSession{User: user, OrganizationID: organization.ID, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
+		session := dashboardSession{User: user, OrganizationID: organization.ID, CSRFToken: csrf, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
 		if !s.writeCookie(w, dashboardCookie, session, 8*time.Hour) {
 			http.Error(w, "could not complete dashboard sign-in", http.StatusInternalServerError)
 			return

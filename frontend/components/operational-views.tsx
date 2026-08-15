@@ -105,6 +105,10 @@ function SettingsPage({ page }: { page: DashboardBootstrap }) {
   </>;
 }
 
+function SignedOutPage() {
+  return <><PageHeading eyebrow="Dashboard session" title="You’re signed out" /><Card className="max-w-xl p-6"><Github aria-hidden="true" className="h-6 w-6" /><h2 className="mt-4 text-lg font-semibold">Your local.env session has ended</h2><p className="mt-2 text-sm text-muted-foreground">Sign in again with GitHub when you want to return to this dashboard.</p><Button asChild className="mt-5"><a href="/login"><Github aria-hidden="true" className="mr-2 h-4 w-4" />Sign in with GitHub</a></Button></Card></>;
+}
+
 function SetupPage({ setup }: { setup: DashboardSetup }) {
   if (setup.state === "configuration_required") return <><PageHeading eyebrow="Instance setup" title="Configure GitHub setup" /><Card className="p-6"><CircleAlert aria-hidden="true" className="h-6 w-6 text-warning" /><h2 className="mt-4 text-lg font-semibold">Bootstrap configuration is required</h2><p className="mt-2 text-sm text-muted-foreground">GitHub setup requires the bootstrap OAuth client and credential-encryption key configured by the instance administrator.</p></Card></>;
   if (setup.state === "sign_in") return <><PageHeading eyebrow="Instance setup" title="Connect GitHub" /><Card className="p-6"><Github aria-hidden="true" className="h-6 w-6" /><h2 className="mt-4 text-lg font-semibold">Choose the organization that owns this instance</h2><p className="mt-2 max-w-xl text-sm text-muted-foreground">Sign in with GitHub to select the organization that will own the local.env GitHub App.</p><Button asChild className="mt-5"><a href={setup.sign_in_url}><Github aria-hidden="true" className="mr-2 h-4 w-4" />Sign in with GitHub</a></Button></Card></>;
@@ -114,6 +118,7 @@ function SetupPage({ setup }: { setup: DashboardSetup }) {
 }
 
 export function OperationalViews({ page }: { page: DashboardBootstrap }) {
+  if (page.view.kind === "signed_out") return <SignedOutPage />;
   if (page.view.kind === "devices") return <DevicesPage devices={page.view.devices} />;
   if (page.view.kind === "audit") return <AuditPage initialEvents={page.view.audit_events} initialNextCursor={page.view.audit_next_cursor} />;
   if (page.view.kind === "settings") return <SettingsPage page={page} />;

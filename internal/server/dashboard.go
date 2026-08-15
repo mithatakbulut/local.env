@@ -31,12 +31,17 @@ type dashboardStore interface {
 type dashboardSession struct {
 	User           githubapp.User `json:"user"`
 	OrganizationID int64          `json:"organization_id"`
+	CSRFToken      string         `json:"csrf_token"`
 	ExpiresAt      time.Time      `json:"expires_at"`
 }
 
 func (s dashboardSession) Expired() bool { return time.Now().UTC().After(s.ExpiresAt) }
 
 func (s *Server) dashboardLogin(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("logged_out") == "1" {
+		s.renderDashboard(w, r, dashboardPage{Title: "Signed out", SignedOut: true})
+		return
+	}
 	if _, ok := s.store.(dashboardStore); !ok || !s.config.GitHubSetupConfigured() {
 		http.Error(w, "dashboard sign-in is unavailable", http.StatusServiceUnavailable)
 		return
@@ -57,6 +62,23 @@ func (s *Server) dashboardLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, authorizeURL, http.StatusFound)
+}
+
+// dashboardLogout removes only the local.env dashboard session. GitHub OAuth
+// access tokens are used only during the callback and are never persisted, so
+// there is no remote credential to revoke here.
+func (s *Server) dashboardLogout(w http.ResponseWriter, r *http.Request) {
+	_, session, ok := s.requireDashboard(w, r)
+	if !ok {
+		return
+	}
+	if session.CSRFToken == "" || r.FormValue("csrf_token") == "" || r.FormValue("csrf_token") != session.CSRFToken {
+		http.Error(w, "dashboard sign-out could not be verified", http.StatusForbidden)
+		return
+	}
+	s.clearCookie(w, dashboardCookie)
+	s.clearCookie(w, oauthStateCookie)
+	http.Redirect(w, r, "/login?logged_out=1", http.StatusSeeOther)
 }
 
 func (s *Server) requireDashboard(w http.ResponseWriter, r *http.Request) (dashboardStore, dashboardSession, bool) {
@@ -89,7 +111,7 @@ func (s *Server) dashboardRepositories(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: "Repositories", User: session.User.Login, RepositoryList: true, Repositories: repositories})
+	s.renderDashboard(w, r, dashboardPage{Title: "Repositories", User: session.User.Login, CSRFToken: session.CSRFToken, RepositoryList: true, Repositories: repositories})
 }
 
 func (s *Server) dashboardRepository(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +124,7 @@ func (s *Server) dashboardRepository(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: repository.Owner + "/" + repository.Name, User: session.User.Login, Repository: &repository})
+	s.renderDashboard(w, r, dashboardPage{Title: repository.Owner + "/" + repository.Name, User: session.User.Login, CSRFToken: session.CSRFToken, Repository: &repository})
 }
 
 func (s *Server) dashboardPullRequest(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +142,7 @@ func (s *Server) dashboardPullRequest(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: fmt.Sprintf("PR #%d", pull.Number), User: session.User.Login, PullRequest: &pull, Owner: r.PathValue("owner"), Repo: r.PathValue("repo")})
+	s.renderDashboard(w, r, dashboardPage{Title: fmt.Sprintf("PR #%d", pull.Number), User: session.User.Login, CSRFToken: session.CSRFToken, PullRequest: &pull, Owner: r.PathValue("owner"), Repo: r.PathValue("repo")})
 }
 
 func (s *Server) dashboardDevices(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +155,7 @@ func (s *Server) dashboardDevices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: "Devices", User: session.User.Login, DeviceList: true, Devices: devices})
+	s.renderDashboard(w, r, dashboardPage{Title: "Devices", User: session.User.Login, CSRFToken: session.CSRFToken, DeviceList: true, Devices: devices})
 }
 
 func (s *Server) dashboardAudit(w http.ResponseWriter, r *http.Request) {
@@ -146,7 +168,7 @@ func (s *Server) dashboardAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: "Audit", User: session.User.Login, AuditList: true, AuditEvents: dashboardAuditEventsFor(page.Events), AuditNextCursor: encodeDashboardAuditCursor(page.NextCursor)})
+	s.renderDashboard(w, r, dashboardPage{Title: "Audit", User: session.User.Login, CSRFToken: session.CSRFToken, AuditList: true, AuditEvents: dashboardAuditEventsFor(page.Events), AuditNextCursor: encodeDashboardAuditCursor(page.NextCursor)})
 }
 
 // dashboardAuditPage returns the next cursor-paginated, metadata-only page
@@ -224,7 +246,7 @@ func (s *Server) dashboardSettings(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: "Settings", User: session.User.Login, PublicURL: s.config.PublicURL.String(), DisplayName: s.config.DisplayName})
+	s.renderDashboard(w, r, dashboardPage{Title: "Settings", User: session.User.Login, CSRFToken: session.CSRFToken, PublicURL: s.config.PublicURL.String(), DisplayName: s.config.DisplayName})
 }
 
 type dashboardMetadata struct {
@@ -238,6 +260,7 @@ type dashboardAuditEvent struct {
 type dashboardPage struct {
 	Title           string
 	User            string
+	CSRFToken       string
 	RepositoryList  bool
 	Repositories    []sqlite.DashboardRepository
 	Repository      *sqlite.DashboardRepository
@@ -251,6 +274,7 @@ type dashboardPage struct {
 	Repo            string
 	PublicURL       string
 	DisplayName     string
+	SignedOut       bool
 	FaviconURL      string
 	Bootstrap       string
 	Stylesheet      string
@@ -264,6 +288,7 @@ type dashboardBootstrap struct {
 	Path        string        `json:"path"`
 	Title       string        `json:"title"`
 	User        string        `json:"user"`
+	CSRFToken   string        `json:"csrf_token,omitempty"`
 	View        dashboardView `json:"view"`
 }
 
@@ -282,6 +307,7 @@ type dashboardView struct {
 	Setup           *dashboardSetupView       `json:"setup,omitempty"`
 	Owner           string                    `json:"owner,omitempty"`
 	Repo            string                    `json:"repo,omitempty"`
+	SignedOut       bool                      `json:"signed_out,omitempty"`
 }
 
 type dashboardRepositoryView struct {
@@ -390,7 +416,7 @@ func (s *Server) renderDashboard(w http.ResponseWriter, r *http.Request, page da
 	page.DisplayName = dashboardDisplayName(s.config.DisplayName)
 	logoURL := brandingURLString(s.config.LogoURL)
 	view := dashboardViewForPage(page)
-	bootstrap, err := json.Marshal(dashboardBootstrap{DisplayName: page.DisplayName, LogoURL: logoURL, Path: r.URL.Path, Title: page.Title, User: page.User, View: view})
+	bootstrap, err := json.Marshal(dashboardBootstrap{DisplayName: page.DisplayName, LogoURL: logoURL, Path: r.URL.Path, Title: page.Title, User: page.User, CSRFToken: page.CSRFToken, View: view})
 	if err != nil {
 		http.Error(w, "dashboard metadata is unavailable", http.StatusInternalServerError)
 		return
@@ -401,11 +427,16 @@ func (s *Server) renderDashboard(w http.ResponseWriter, r *http.Request, page da
 	page.Stylesheet = assets.Stylesheet
 	page.Script = assets.Script
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if page.CSRFToken != "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	_ = dashboardTemplate.Execute(w, page)
 }
 
 func dashboardViewForPage(page dashboardPage) dashboardView {
 	switch {
+	case page.SignedOut:
+		return dashboardView{Kind: "signed_out", SignedOut: true}
 	case page.RepositoryList:
 		view := dashboardView{Kind: "repositories", Repositories: make([]dashboardRepositoryView, 0, len(page.Repositories))}
 		for _, repository := range page.Repositories {

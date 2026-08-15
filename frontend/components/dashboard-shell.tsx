@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Activity, BookOpen, ChevronRight, Laptop, Menu, Settings, ShieldCheck, X } from "lucide-react";
+import { Activity, BookOpen, ChevronRight, Laptop, LogOut, Menu, Settings, ShieldCheck, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -59,7 +59,7 @@ export type DashboardSetup = {
 };
 
 type DashboardView = {
-  kind: "legacy" | "repositories" | "repository" | "pull_request" | "devices" | "audit" | "settings" | "setup";
+  kind: "legacy" | "repositories" | "repository" | "pull_request" | "devices" | "audit" | "settings" | "setup" | "signed_out";
   repositories: DashboardRepository[];
   repository?: DashboardRepository;
   pull_request?: DashboardPullRequest;
@@ -78,6 +78,7 @@ export type DashboardBootstrap = {
   path: string;
   title: string;
   user: string;
+  csrf_token?: string;
   view: DashboardView;
 };
 
@@ -140,6 +141,7 @@ function isView(value: unknown): value is DashboardView {
   if (view.kind === "devices") return Array.isArray(view.devices) && view.devices.every(isDevice);
   if (view.kind === "audit") return Array.isArray(view.audit_events) && view.audit_events.every(isAuditEvent) && (view.audit_next_cursor === undefined || typeof view.audit_next_cursor === "string");
   if (view.kind === "settings") return Boolean(view.settings) && typeof view.settings?.public_url === "string";
+  if (view.kind === "signed_out") return true;
   return view.kind === "setup" && isSetup(view.setup);
 }
 
@@ -172,6 +174,7 @@ function Navigation({ page, onNavigate }: { page: DashboardBootstrap; onNavigate
           </a>
         );
       })}
+      {page.csrf_token && <form method="post" action="/logout" className="pt-3"><input type="hidden" name="csrf_token" value={page.csrf_token} /><button type="submit" onClick={onNavigate} className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"><LogOut aria-hidden="true" className="h-4 w-4" />Sign out</button></form>}
     </nav>
   );
 }
@@ -184,9 +187,10 @@ export function DashboardShell({ page }: { page: DashboardBootstrap }) {
   }, []);
 
   const isSetup = page.path === "/setup";
+  const isPublic = page.view.kind === "signed_out";
   return (
     <>
-      <aside className={cn("fixed inset-y-0 left-0 z-30 hidden w-64 border-r border-border bg-background p-4 md:flex md:flex-col", isSetup && "hidden")}>
+      <aside className={cn("fixed inset-y-0 left-0 z-30 hidden w-64 border-r border-border bg-background p-4 md:flex md:flex-col", (isSetup || isPublic) && "hidden")}>
         <BrandMark page={page} />
         <div className="mt-8"><Navigation page={page} /></div>
         <div className="mt-auto border-t border-border pt-4">
@@ -195,13 +199,13 @@ export function DashboardShell({ page }: { page: DashboardBootstrap }) {
         </div>
       </aside>
 
-      <header className={cn("fixed inset-x-0 top-0 z-20 flex h-16 items-center justify-between border-b border-border bg-background/95 px-4 backdrop-blur md:left-64", isSetup && "md:left-0")}>
-        <div className="md:hidden"><BrandMark page={page} /></div>
-        <div className="hidden md:block">
+      <header className={cn("fixed inset-x-0 top-0 z-20 flex h-16 items-center justify-between border-b border-border bg-background/95 px-4 backdrop-blur md:left-64", (isSetup || isPublic) && "md:left-0")}>
+        <div className={cn("md:hidden", isPublic && "md:block")}><BrandMark page={page} /></div>
+        <div className={cn("hidden", !isPublic && "md:block")}>
           <p className="text-xs font-medium text-muted-foreground">{isSetup ? "Instance setup" : "Operational dashboard"}</p>
           <p className="text-sm font-semibold">{page.title}</p>
         </div>
-        {!isSetup && <button type="button" className="rounded-md border border-border p-2 text-foreground md:hidden" aria-expanded={open} aria-controls="mobile-navigation" aria-label={open ? "Close navigation" : "Open navigation"} onClick={() => setOpen((value) => !value)}>{open ? <X aria-hidden="true" className="h-5 w-5" /> : <Menu aria-hidden="true" className="h-5 w-5" />}</button>}
+        {!isSetup && !isPublic && <button type="button" className="rounded-md border border-border p-2 text-foreground md:hidden" aria-expanded={open} aria-controls="mobile-navigation" aria-label={open ? "Close navigation" : "Open navigation"} onClick={() => setOpen((value) => !value)}>{open ? <X aria-hidden="true" className="h-5 w-5" /> : <Menu aria-hidden="true" className="h-5 w-5" />}</button>}
         {isSetup && <Badge variant="success"><ShieldCheck aria-hidden="true" className="h-3.5 w-3.5" />Self-hosted</Badge>}
       </header>
 
