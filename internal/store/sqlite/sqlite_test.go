@@ -342,11 +342,26 @@ func TestKeyRotationReencryptsCurrentSnapshotAndExcludesRevokedDevice(t *testing
 	if err := store.UpdateBaselineSecret(ctx, "acme", "api", owner.ID, ownerDevice.ID, fileID, "DATABASE_URL", 0, SecretEnvelope(envelope)); err != nil {
 		t.Fatal(err)
 	}
+	pull := githubapp.PullRequest{Number: 100, BaseSHA: "base", HeadSHA: "head", AuthorID: owner.ID, State: "open", Repository: githubapp.Repository{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main"}}
+	if _, err := store.SavePullRequestRequirements(ctx, pull, []pranalysis.Requirement{{FileID: fileID, KeyName: "REDIS_URL", State: pranalysis.StateMissing}}); err != nil {
+		t.Fatal(err)
+	}
+	promotedEnvelope, err := cryptokit.Encrypt(oldREK, []byte("rotation-promoted-non-secret-sentinel"), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: ".env.local", KeyName: "REDIS_URL", Scope: "pull_request", ScopeID: "100", Version: 1, KeyEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdatePullRequestSecret(ctx, "acme", "api", 100, owner.ID, ownerDevice.ID, fileID, "REDIS_URL", 0, SecretEnvelope(promotedEnvelope)); err != nil {
+		t.Fatal(err)
+	}
+	pull.State = "merged"
+	if err := store.ClosePullRequest(ctx, pull); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.RevokeDevice(ctx, owner.ID, ownerDevice.ID, formerDevice.ID); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", owner.ID, ownerDevice.ID)
-	if err != nil || len(snapshot.Secrets) != 1 {
+	if err != nil || len(snapshot.Secrets) != 2 {
 		t.Fatalf("rotation snapshot = %#v, %v", snapshot, err)
 	}
 	newREK, err := cryptokit.GenerateREK()
@@ -358,26 +373,41 @@ func TestKeyRotationReencryptsCurrentSnapshotAndExcludesRevokedDevice(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret := snapshot.Secrets[0]
-	plaintext, err := cryptokit.Decrypt(oldREK, cryptokit.Envelope(secret.Envelope), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version, KeyEpoch: secret.Envelope.KeyEpoch})
-	if err != nil {
-		t.Fatal(err)
+	rotation := KeyRotation{ExpectedEpoch: 1, WrappedKeys: []RotationWrappedKey{{DeviceID: ownerDevice.ID, WrappedREK: newOwnerWrap}}}
+	for _, secret := range snapshot.Secrets {
+		plaintext, err := cryptokit.Decrypt(oldREK, cryptokit.Envelope(secret.Envelope), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version, KeyEpoch: secret.Envelope.KeyEpoch})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rotated, err := cryptokit.Encrypt(newREK, plaintext, cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version + 1, KeyEpoch: 2})
+		clearTestBytes(plaintext)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rotation.Secrets = append(rotation.Secrets, RotationSecret{FileID: secret.FileID, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Envelope: SecretEnvelope(rotated)})
 	}
-	rotated, err := cryptokit.Encrypt(newREK, plaintext, cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version + 1, KeyEpoch: 2})
-	clearTestBytes(plaintext)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err = store.RotateRepositoryKey(ctx, "acme", "api", owner.ID, ownerDevice.ID, KeyRotation{ExpectedEpoch: 1, WrappedKeys: []RotationWrappedKey{{DeviceID: ownerDevice.ID, WrappedREK: newOwnerWrap}}, Secrets: []RotationSecret{{FileID: secret.FileID, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Envelope: SecretEnvelope(rotated)}}})
+	state, err = store.RotateRepositoryKey(ctx, "acme", "api", owner.ID, ownerDevice.ID, rotation)
 	if err != nil || state.ActiveKeyEpoch != 2 {
 		t.Fatalf("RotateRepositoryKey() = %#v, %v", state, err)
 	}
 	rotatedSnapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", owner.ID, ownerDevice.ID)
-	if err != nil || rotatedSnapshot.Secrets[0].Envelope.KeyEpoch != 2 {
+	if err != nil || len(rotatedSnapshot.Secrets) != 2 {
 		t.Fatalf("rotated snapshot = %#v, %v", rotatedSnapshot, err)
 	}
-	if _, err := cryptokit.Decrypt(oldREK, cryptokit.Envelope(rotatedSnapshot.Secrets[0].Envelope), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Version: 2, KeyEpoch: 2}); err == nil {
-		t.Fatal("former device's retained epoch-1 REK decrypted epoch-2 data")
+	var promotedRetained bool
+	for _, secret := range rotatedSnapshot.Secrets {
+		if secret.Envelope.KeyEpoch != 2 {
+			t.Fatalf("rotated secret epoch = %d, want 2", secret.Envelope.KeyEpoch)
+		}
+		if secret.KeyName == "REDIS_URL" && secret.Scope == "pull_request" && secret.ScopeID == "100" {
+			promotedRetained = true
+		}
+		if _, err := cryptokit.Decrypt(oldREK, cryptokit.Envelope(secret.Envelope), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version, KeyEpoch: secret.Envelope.KeyEpoch}); err == nil {
+			t.Fatal("former device's retained epoch-1 REK decrypted epoch-2 data")
+		}
+	}
+	if !promotedRetained {
+		t.Fatal("rotated snapshot omitted promoted pull-request ciphertext")
 	}
 	if _, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", former.ID, formerDevice.ID); err == nil {
 		t.Fatal("revoked device received epoch-2 snapshot")

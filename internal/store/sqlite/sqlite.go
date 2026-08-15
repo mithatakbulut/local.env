@@ -1261,7 +1261,7 @@ func (s *Store) RepositorySnapshotForDevice(ctx context.Context, owner, name str
 		return RepositorySnapshot{}, fmt.Errorf("read wrapped repository key: %w", err)
 	}
 	result := RepositorySnapshot{Repository: state, WrappedREK: append([]byte(nil), wrapped...)}
-	rows, err := s.db.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.algorithm, sv.key_epoch, sv.nonce, sv.ciphertext, sv.version FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.archived_at IS NULL AND (sv.scope = 'baseline' OR sv.promoted_at IS NOT NULL) AND sv.version = (SELECT MAX(current.version) FROM secret_versions current WHERE current.repository_id = sv.repository_id AND current.file_id = sv.file_id AND current.key_name = sv.key_name AND current.scope = sv.scope AND current.scope_id = sv.scope_id AND current.archived_at IS NULL) ORDER BY sv.file_id, sv.key_name, sv.scope, sv.scope_id`, repositoryID)
+	rows, err := s.db.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.algorithm, sv.key_epoch, sv.nonce, sv.ciphertext, sv.version FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.archived_at IS NULL AND (sv.scope = 'baseline' OR EXISTS (SELECT 1 FROM secret_versions promoted WHERE promoted.repository_id = sv.repository_id AND promoted.file_id = sv.file_id AND promoted.key_name = sv.key_name AND promoted.scope = sv.scope AND promoted.scope_id = sv.scope_id AND promoted.promoted_at IS NOT NULL)) AND sv.version = (SELECT MAX(current.version) FROM secret_versions current WHERE current.repository_id = sv.repository_id AND current.file_id = sv.file_id AND current.key_name = sv.key_name AND current.scope = sv.scope AND current.scope_id = sv.scope_id AND current.archived_at IS NULL) ORDER BY sv.file_id, sv.key_name, sv.scope, sv.scope_id`, repositoryID)
 	if err != nil {
 		return RepositorySnapshot{}, fmt.Errorf("list encrypted repository snapshot: %w", err)
 	}
@@ -1689,15 +1689,16 @@ func (s *Store) RotateRepositoryKey(ctx context.Context, owner, name string, git
 	type currentSecret struct {
 		fileID, filePath, keyName, scope, scopeID string
 		version                                   int64
+		promotedAt                                sql.NullString
 	}
 	current := make(map[string]currentSecret)
-	rows, err = tx.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.version FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.archived_at IS NULL AND (sv.scope = 'baseline' OR sv.promoted_at IS NOT NULL) AND sv.version = (SELECT MAX(existing.version) FROM secret_versions existing WHERE existing.repository_id = sv.repository_id AND existing.file_id = sv.file_id AND existing.key_name = sv.key_name AND existing.scope = sv.scope AND existing.scope_id = sv.scope_id AND existing.archived_at IS NULL)`, repositoryID)
+	rows, err = tx.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.version, COALESCE(sv.promoted_at, (SELECT promoted.promoted_at FROM secret_versions promoted WHERE promoted.repository_id = sv.repository_id AND promoted.file_id = sv.file_id AND promoted.key_name = sv.key_name AND promoted.scope = sv.scope AND promoted.scope_id = sv.scope_id AND promoted.promoted_at IS NOT NULL ORDER BY promoted.version DESC LIMIT 1)) FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.archived_at IS NULL AND (sv.scope = 'baseline' OR EXISTS (SELECT 1 FROM secret_versions promoted WHERE promoted.repository_id = sv.repository_id AND promoted.file_id = sv.file_id AND promoted.key_name = sv.key_name AND promoted.scope = sv.scope AND promoted.scope_id = sv.scope_id AND promoted.promoted_at IS NOT NULL)) AND sv.version = (SELECT MAX(existing.version) FROM secret_versions existing WHERE existing.repository_id = sv.repository_id AND existing.file_id = sv.file_id AND existing.key_name = sv.key_name AND existing.scope = sv.scope AND existing.scope_id = sv.scope_id AND existing.archived_at IS NULL)`, repositoryID)
 	if err != nil {
 		return RepositoryCryptoState{}, fmt.Errorf("list repository rotation snapshot: %w", err)
 	}
 	for rows.Next() {
 		var secret currentSecret
-		if err := rows.Scan(&secret.fileID, &secret.filePath, &secret.keyName, &secret.scope, &secret.scopeID, &secret.version); err != nil {
+		if err := rows.Scan(&secret.fileID, &secret.filePath, &secret.keyName, &secret.scope, &secret.scopeID, &secret.version, &secret.promotedAt); err != nil {
 			rows.Close()
 			return RepositoryCryptoState{}, fmt.Errorf("scan repository rotation snapshot: %w", err)
 		}
@@ -1738,7 +1739,12 @@ func (s *Store) RotateRepositoryKey(ctx context.Context, owner, name string, git
 		if err != nil {
 			return RepositoryCryptoState{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO secret_versions(id, repository_id, file_id, key_name, scope, scope_id, version, key_epoch, algorithm, nonce, ciphertext, created_by_user_id, created_at, archived_at, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`, id, repositoryID, secret.FileID, secret.KeyName, secret.Scope, secret.ScopeID, secret.Envelope.Version, secret.Envelope.KeyEpoch, secret.Envelope.Algorithm, secret.Envelope.Nonce, secret.Envelope.Ciphertext, strconv.FormatInt(githubUserID, 10), now); err != nil {
+		var promotedAt any
+		currentSecret := current[rotationSecretID(secret.FileID, secret.KeyName, secret.Scope, secret.ScopeID)]
+		if currentSecret.promotedAt.Valid {
+			promotedAt = currentSecret.promotedAt.String
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO secret_versions(id, repository_id, file_id, key_name, scope, scope_id, version, key_epoch, algorithm, nonce, ciphertext, created_by_user_id, created_at, archived_at, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`, id, repositoryID, secret.FileID, secret.KeyName, secret.Scope, secret.ScopeID, secret.Envelope.Version, secret.Envelope.KeyEpoch, secret.Envelope.Algorithm, secret.Envelope.Nonce, secret.Envelope.Ciphertext, strconv.FormatInt(githubUserID, 10), now, promotedAt); err != nil {
 			return RepositoryCryptoState{}, fmt.Errorf("store rotated encrypted secret: %w", err)
 		}
 	}
