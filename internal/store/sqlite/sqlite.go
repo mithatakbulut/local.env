@@ -34,6 +34,7 @@ var (
 	ErrSecretVersionConflict        = errors.New("secret version conflict")
 	ErrPullRequestNotOpen           = errors.New("pull request is not open")
 	ErrDeviceAccessNotFound         = errors.New("device access request not found")
+	ErrKeyRotationConflict          = errors.New("repository key rotation conflict")
 )
 
 // Store owns a single SQLite connection. A single connection keeps connection
@@ -138,6 +139,29 @@ type RepositoryDevice struct {
 	Device
 	GitHubLogin string `json:"github_login"`
 	HasKey      bool   `json:"has_key"`
+}
+
+// KeyRotation is the ciphertext-only, client-produced replacement snapshot
+// for one repository key epoch. The server cannot construct it because it
+// never has a plaintext REK or secret value.
+type KeyRotation struct {
+	ExpectedEpoch int64                `json:"expected_epoch"`
+	WrappedKeys   []RotationWrappedKey `json:"wrapped_keys"`
+	Secrets       []RotationSecret     `json:"secrets"`
+}
+
+type RotationWrappedKey struct {
+	DeviceID   string `json:"device_id"`
+	WrappedREK []byte `json:"wrapped_rek"`
+}
+
+type RotationSecret struct {
+	FileID   string         `json:"file_id"`
+	FilePath string         `json:"file_path"`
+	KeyName  string         `json:"key_name"`
+	Scope    string         `json:"scope"`
+	ScopeID  string         `json:"scope_id"`
+	Envelope SecretEnvelope `json:"envelope"`
 }
 
 // CreateAuthExchange records a one-time, short-lived CLI exchange code by
@@ -1533,6 +1557,166 @@ func (s *Store) InitializeRepositoryCrypto(ctx context.Context, owner, name stri
 	return state, nil
 }
 
+// RotateRepositoryKey atomically activates a client-created epoch and its
+// complete re-encrypted current snapshot. It verifies every active key holder
+// receives exactly one new wrapped REK before retiring the old epoch.
+func (s *Store) RotateRepositoryKey(ctx context.Context, owner, name string, githubUserID int64, deviceID string, rotation KeyRotation) (RepositoryCryptoState, error) {
+	if githubUserID <= 0 || deviceID == "" || rotation.ExpectedEpoch <= 0 || len(rotation.WrappedKeys) == 0 {
+		return RepositoryCryptoState{}, errors.New("invalid repository key rotation")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("begin repository key rotation: %w", err)
+	}
+	defer tx.Rollback()
+
+	var repositoryID string
+	var state RepositoryCryptoState
+	err = tx.QueryRowContext(ctx, `
+		SELECT r.id, i.crypto_instance_id, r.github_repo_id, r.owner, r.name,
+		       r.active_key_epoch, gir.github_installation_id
+		FROM repositories r
+		JOIN instance i ON i.id = 'singleton'
+		JOIN github_installation_repositories gir
+		  ON gir.github_repo_id = r.github_repo_id AND gir.active = 1
+		WHERE r.owner = ? AND r.name = ?`, owner, name).Scan(
+		&repositoryID, &state.InstanceID, &state.GitHubRepoID, &state.Owner,
+		&state.Name, &state.ActiveKeyEpoch, &state.InstallationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RepositoryCryptoState{}, ErrRepositoryNotManaged
+	}
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("read repository key rotation state: %w", err)
+	}
+	if state.ActiveKeyEpoch != rotation.ExpectedEpoch {
+		return RepositoryCryptoState{}, ErrKeyRotationConflict
+	}
+	var authorized bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wrapped_repo_keys wr JOIN devices d ON d.id = wr.device_id WHERE wr.repository_id = ? AND wr.epoch = ? AND d.id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL)`, repositoryID, state.ActiveKeyEpoch, deviceID, githubUserID).Scan(&authorized)
+	if err != nil || !authorized {
+		return RepositoryCryptoState{}, errors.New("active device does not have the repository key")
+	}
+
+	activeDevices := make(map[string]struct{})
+	rows, err := tx.QueryContext(ctx, `SELECT d.id FROM wrapped_repo_keys wr JOIN devices d ON d.id = wr.device_id WHERE wr.repository_id = ? AND wr.epoch = ? AND d.revoked_at IS NULL ORDER BY d.id`, repositoryID, state.ActiveKeyEpoch)
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("list active repository devices: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return RepositoryCryptoState{}, fmt.Errorf("scan active repository device: %w", err)
+		}
+		activeDevices[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RepositoryCryptoState{}, fmt.Errorf("iterate active repository devices: %w", err)
+	}
+	rows.Close()
+	providedDevices := make(map[string]struct{}, len(rotation.WrappedKeys))
+	for _, key := range rotation.WrappedKeys {
+		if key.DeviceID == "" || len(key.WrappedREK) == 0 || len(key.WrappedREK) > 64<<10 {
+			return RepositoryCryptoState{}, errors.New("invalid rotated wrapped repository key")
+		}
+		if _, duplicate := providedDevices[key.DeviceID]; duplicate {
+			return RepositoryCryptoState{}, errors.New("duplicate rotated wrapped repository key")
+		}
+		providedDevices[key.DeviceID] = struct{}{}
+	}
+	if len(providedDevices) != len(activeDevices) {
+		return RepositoryCryptoState{}, ErrKeyRotationConflict
+	}
+	for id := range activeDevices {
+		if _, found := providedDevices[id]; !found {
+			return RepositoryCryptoState{}, ErrKeyRotationConflict
+		}
+	}
+
+	type currentSecret struct {
+		fileID, filePath, keyName, scope, scopeID string
+		version                                   int64
+	}
+	current := make(map[string]currentSecret)
+	rows, err = tx.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.version FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.archived_at IS NULL AND (sv.scope = 'baseline' OR sv.promoted_at IS NOT NULL) AND sv.version = (SELECT MAX(existing.version) FROM secret_versions existing WHERE existing.repository_id = sv.repository_id AND existing.file_id = sv.file_id AND existing.key_name = sv.key_name AND existing.scope = sv.scope AND existing.scope_id = sv.scope_id AND existing.archived_at IS NULL)`, repositoryID)
+	if err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("list repository rotation snapshot: %w", err)
+	}
+	for rows.Next() {
+		var secret currentSecret
+		if err := rows.Scan(&secret.fileID, &secret.filePath, &secret.keyName, &secret.scope, &secret.scopeID, &secret.version); err != nil {
+			rows.Close()
+			return RepositoryCryptoState{}, fmt.Errorf("scan repository rotation snapshot: %w", err)
+		}
+		current[rotationSecretID(secret.fileID, secret.keyName, secret.scope, secret.scopeID)] = secret
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RepositoryCryptoState{}, fmt.Errorf("iterate repository rotation snapshot: %w", err)
+	}
+	rows.Close()
+	if len(rotation.Secrets) != len(current) {
+		return RepositoryCryptoState{}, ErrKeyRotationConflict
+	}
+	rotated := make(map[string]RotationSecret, len(rotation.Secrets))
+	for _, secret := range rotation.Secrets {
+		id := rotationSecretID(secret.FileID, secret.KeyName, secret.Scope, secret.ScopeID)
+		expected, found := current[id]
+		if !found || secret.FilePath != expected.filePath || !validSecretIdentity(secret.FileID, secret.KeyName) || !validSecretEnvelope(secret.Envelope) || secret.Envelope.KeyEpoch != state.ActiveKeyEpoch+1 || secret.Envelope.Version != expected.version+1 {
+			return RepositoryCryptoState{}, ErrKeyRotationConflict
+		}
+		if _, duplicate := rotated[id]; duplicate {
+			return RepositoryCryptoState{}, ErrKeyRotationConflict
+		}
+		rotated[id] = secret
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_key_epochs(repository_id, epoch, status, created_at, retired_at) VALUES (?, ?, 'active', ?, NULL)`, repositoryID, state.ActiveKeyEpoch+1, now); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("create repository key epoch: %w", err)
+	}
+	for _, key := range rotation.WrappedKeys {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO wrapped_repo_keys(repository_id, epoch, device_id, wrapped_key, created_at) VALUES (?, ?, ?, ?, ?)`, repositoryID, state.ActiveKeyEpoch+1, key.DeviceID, key.WrappedREK, now); err != nil {
+			return RepositoryCryptoState{}, fmt.Errorf("store rotated wrapped repository key: %w", err)
+		}
+	}
+	for _, secret := range rotation.Secrets {
+		id, err := newUUID()
+		if err != nil {
+			return RepositoryCryptoState{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO secret_versions(id, repository_id, file_id, key_name, scope, scope_id, version, key_epoch, algorithm, nonce, ciphertext, created_by_user_id, created_at, archived_at, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`, id, repositoryID, secret.FileID, secret.KeyName, secret.Scope, secret.ScopeID, secret.Envelope.Version, secret.Envelope.KeyEpoch, secret.Envelope.Algorithm, secret.Envelope.Nonce, secret.Envelope.Ciphertext, strconv.FormatInt(githubUserID, 10), now); err != nil {
+			return RepositoryCryptoState{}, fmt.Errorf("store rotated encrypted secret: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE repo_key_epochs SET status = 'retired', retired_at = ? WHERE repository_id = ? AND epoch = ? AND status = 'active'`, now, repositoryID, state.ActiveKeyEpoch); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("retire repository key epoch: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE repositories SET active_key_epoch = ? WHERE id = ? AND active_key_epoch = ?`, state.ActiveKeyEpoch+1, repositoryID, state.ActiveKeyEpoch); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("activate repository key epoch: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM wrapped_repo_keys WHERE repository_id = ? AND epoch = ?`, repositoryID, state.ActiveKeyEpoch); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("delete retired wrapped repository keys: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("advance repository revision: %w", err)
+	}
+	if err := insertAuditEvent(ctx, tx, githubUserID, deviceID, repositoryID, "repository.key_rotated", map[string]string{"from_epoch": strconv.FormatInt(state.ActiveKeyEpoch, 10), "to_epoch": strconv.FormatInt(state.ActiveKeyEpoch+1, 10)}); err != nil {
+		return RepositoryCryptoState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RepositoryCryptoState{}, fmt.Errorf("commit repository key rotation: %w", err)
+	}
+	state.ActiveKeyEpoch++
+	state.Initialized = true
+	return state, nil
+}
+
+func rotationSecretID(fileID, keyName, scope, scopeID string) string {
+	return fileID + "\x00" + keyName + "\x00" + scope + "\x00" + scopeID
+}
+
 func validRepositoryName(value string) bool {
 	return value != "" && strings.TrimSpace(value) == value && len(value) <= 255 && !strings.ContainsAny(value, "/\\\x00")
 }
@@ -1636,3 +1820,26 @@ func validRepositoryRelativePath(value string) bool {
 
 // Close closes the database connection.
 func (s *Store) Close() error { return s.db.Close() }
+
+// BackupTo creates a transactionally consistent SQLite database copy without
+// relying on copying a live WAL database. destination must not already exist.
+func (s *Store) BackupTo(ctx context.Context, destination string) error {
+	if strings.TrimSpace(destination) == "" || !filepath.IsAbs(destination) {
+		return errors.New("backup destination must be an absolute path")
+	}
+	if _, err := os.Lstat(destination); err == nil {
+		return errors.New("backup destination already exists")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("inspect backup destination: %w", err)
+	}
+	// VACUUM INTO is SQLite's safe online-copy mechanism. Quote the filename as
+	// a SQL literal after rejecting no path content; values never enter this SQL.
+	escaped := strings.ReplaceAll(destination, "'", "''")
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO '"+escaped+"'"); err != nil {
+		return fmt.Errorf("create online SQLite backup: %w", err)
+	}
+	if err := os.Chmod(destination, 0o600); err != nil {
+		return fmt.Errorf("secure SQLite backup: %w", err)
+	}
+	return nil
+}

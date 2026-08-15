@@ -68,6 +68,7 @@ type cliAuthStore interface {
 type repositoryCryptoStore interface {
 	RepositoryCryptoState(context.Context, string, string) (sqlite.RepositoryCryptoState, error)
 	InitializeRepositoryCrypto(context.Context, string, string, int64, string, []byte) (sqlite.RepositoryCryptoState, error)
+	RotateRepositoryKey(context.Context, string, string, int64, string, sqlite.KeyRotation) (sqlite.RepositoryCryptoState, error)
 }
 
 type encryptedSecretStore interface {
@@ -130,6 +131,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/repos/{owner}/{repo}/devices/{id}", s.revokeDevice)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}", s.repositoryCryptoState)
 	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/init", s.initializeRepositoryCrypto)
+	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/key-epochs", s.rotateRepositoryKey)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/snapshot", s.repositorySnapshot)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/pulls/current", s.currentPullRequest)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/pulls/{number}/snapshot", s.pullRequestSnapshot)
@@ -138,6 +140,50 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/repos/{owner}/{repo}/pulls/{number}/secrets/{fileID}/{keyName}", s.updatePullRequestSecret)
 	mux.HandleFunc("POST /api/v1/github/webhook", s.githubWebhook)
 	return mux
+}
+
+// rotateRepositoryKey accepts only a complete client-side re-encryption of
+// the current snapshot. No secret value or plaintext REK crosses this API.
+func (s *Server) rotateRepositoryKey(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	if authenticated.Device.ID == "" {
+		http.Error(w, "active device is required", http.StatusBadRequest)
+		return
+	}
+	store, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository key persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := store.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil || !state.Initialized {
+		http.Error(w, "repository encryption is unavailable", http.StatusBadRequest)
+		return
+	}
+	if !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	var rotation sqlite.KeyRotation
+	if !decodeRequestJSON(w, r, &rotation) {
+		return
+	}
+	state, err = store.RotateRepositoryKey(r.Context(), state.Owner, state.Name, authenticated.User.ID, authenticated.Device.ID, rotation)
+	if errors.Is(err, sqlite.ErrKeyRotationConflict) {
+		http.Error(w, "repository key rotation conflicted; download a fresh snapshot and retry", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository key rotation was rejected", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusCreated, state)
 }
 
 func (s *Server) currentPullRequest(w http.ResponseWriter, r *http.Request) {

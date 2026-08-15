@@ -68,6 +68,8 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runDoctor(args[1:], out, errOut)
 	case "devices":
 		return runDevices(args[1:], out, errOut)
+	case "keys":
+		return runKeys(args[1:], out, errOut)
 	case "--version", "version":
 		return 0
 	case "--help", "help":
@@ -95,6 +97,7 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  run -- COMMAND        Run a command with managed values injected in memory")
 	fmt.Fprintln(out, "  doctor                Check local.env connectivity and local configuration")
 	fmt.Fprintln(out, "  devices               List, approve, or revoke repository devices")
+	fmt.Fprintln(out, "  keys rotate           Re-encrypt current values with a new repository key")
 }
 
 // runRuntime decrypts the repository snapshot only in this process, adds its
@@ -1305,6 +1308,115 @@ func runDevices(args []string, out, errOut io.Writer) int {
 	return 2
 }
 
+// runKeys performs the entire rotation locally: it opens the current
+// ciphertext with the caller's old REK, creates a new REK, and uploads only
+// new ciphertext plus device-specific age wraps.
+func runKeys(args []string, out, errOut io.Writer) int {
+	if len(args) == 0 || args[0] != "rotate" {
+		fmt.Fprintln(errOut, "Usage: localenv keys rotate [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	flags := flag.NewFlagSet("keys rotate", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 {
+		fmt.Fprintln(errOut, "Usage: localenv keys rotate [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: credential storage is unavailable")
+		return 1
+	}
+	instance, token, err := currentSession(secrets, *instanceFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: not signed in; run localenv login <instance-url>")
+		return 1
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: this machine has no registered device identity; run localenv login again")
+		return 1
+	}
+	owner, name, err := selectedRepository(*repositoryFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository was not detected; pass --repo owner/name")
+		return 1
+	}
+	snapshot, err := fetchRepositorySnapshot(context.Background(), instance, token, owner, name)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not retrieve the current encrypted repository snapshot")
+		return 1
+	}
+	oldREK, err := cryptokit.UnwrapREK(identity.Identity, snapshot.WrappedREK)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not unwrap the current repository encryption key")
+		return 1
+	}
+	defer clear(oldREK)
+	devices, err := fetchRepositoryDevices(context.Background(), instance, token, owner, name)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not retrieve active repository devices")
+		return 1
+	}
+	active := 0
+	for _, device := range devices {
+		if device.HasKey {
+			active++
+		}
+	}
+	fmt.Fprintf(out, "Rotate repository key for %s/%s? This re-encrypts %d current value(s) for %d active device(s). [y/N] ", owner, name, len(snapshot.Secrets), active)
+	if !confirmResponse() {
+		fmt.Fprintln(out, "Repository key rotation cancelled.")
+		return 1
+	}
+	newREK, err := cryptokit.GenerateREK()
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not generate a new repository encryption key")
+		return 1
+	}
+	defer clear(newREK)
+	rotation := apiKeyRotation{ExpectedEpoch: snapshot.Repository.ActiveKeyEpoch}
+	for _, device := range devices {
+		if !device.HasKey || device.PublicRecipient == "" {
+			continue
+		}
+		wrapped, err := cryptokit.WrapREK(newREK, device.PublicRecipient)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not wrap the new repository key for every active device")
+			return 1
+		}
+		rotation.WrappedKeys = append(rotation.WrappedKeys, apiRotationWrappedKey{DeviceID: device.ID, WrappedREK: wrapped})
+	}
+	for _, secret := range snapshot.Secrets {
+		aad := cryptokit.AAD{InstanceID: snapshot.Repository.InstanceID, GitHubRepoID: snapshot.Repository.GitHubRepoID, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version, KeyEpoch: secret.Envelope.KeyEpoch}
+		plaintext, err := cryptokit.Decrypt(oldREK, secret.Envelope, aad)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not authenticate the current encrypted repository snapshot")
+			return 1
+		}
+		rotatedAAD := aad
+		rotatedAAD.Version++
+		rotatedAAD.KeyEpoch++
+		envelope, encryptErr := cryptokit.Encrypt(newREK, plaintext, rotatedAAD)
+		clear(plaintext)
+		if encryptErr != nil {
+			fmt.Fprintln(errOut, "localenv: could not re-encrypt the current repository snapshot")
+			return 1
+		}
+		rotation.Secrets = append(rotation.Secrets, apiRotationSecret{FileID: secret.FileID, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Envelope: envelope})
+	}
+	var state apiRepositoryCryptoState
+	if err := rotateRepositoryKey(context.Background(), instance, token, owner, name, rotation, &state); err != nil {
+		fmt.Fprintln(errOut, "localenv: repository key rotation was rejected; no new epoch was activated")
+		return 1
+	}
+	fmt.Fprintf(out, "Repository key rotated to epoch %d. Revoked devices cannot decrypt this epoch.\n", state.ActiveKeyEpoch)
+	return 0
+}
+
 func confirm(out io.Writer) bool {
 	fmt.Fprint(out, "Continue? [y/N] ")
 	return confirmResponse()
@@ -1587,11 +1699,32 @@ type apiDeviceAccessRequest struct {
 }
 
 type apiRepositoryDevice struct {
-	ID          string `json:"id"`
-	GitHubLogin string `json:"github_login"`
-	Name        string `json:"name"`
-	Fingerprint string `json:"fingerprint"`
-	HasKey      bool   `json:"has_key"`
+	ID              string `json:"id"`
+	GitHubLogin     string `json:"github_login"`
+	Name            string `json:"name"`
+	PublicRecipient string `json:"public_recipient"`
+	Fingerprint     string `json:"fingerprint"`
+	HasKey          bool   `json:"has_key"`
+}
+
+type apiRotationWrappedKey struct {
+	DeviceID   string `json:"device_id"`
+	WrappedREK []byte `json:"wrapped_rek"`
+}
+
+type apiRotationSecret struct {
+	FileID   string             `json:"file_id"`
+	FilePath string             `json:"file_path"`
+	KeyName  string             `json:"key_name"`
+	Scope    string             `json:"scope"`
+	ScopeID  string             `json:"scope_id"`
+	Envelope cryptokit.Envelope `json:"envelope"`
+}
+
+type apiKeyRotation struct {
+	ExpectedEpoch int64                   `json:"expected_epoch"`
+	WrappedKeys   []apiRotationWrappedKey `json:"wrapped_keys"`
+	Secrets       []apiRotationSecret     `json:"secrets"`
 }
 
 func exchange(ctx context.Context, instance, code string) (apiSession, error) {
@@ -1650,6 +1783,10 @@ func fetchRepositoryDevices(ctx context.Context, instance, token, owner, name st
 func revokeRepositoryDevice(ctx context.Context, instance, token, owner, name, deviceID string) error {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/devices/%s", instance, url.PathEscape(owner), url.PathEscape(name), url.PathEscape(deviceID))
 	return requestJSON(ctx, http.MethodDelete, endpoint, token, nil, nil)
+}
+func rotateRepositoryKey(ctx context.Context, instance, token, owner, name string, rotation apiKeyRotation, target *apiRepositoryCryptoState) error {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/key-epochs", instance, url.PathEscape(owner), url.PathEscape(name))
+	return requestJSON(ctx, http.MethodPost, endpoint, token, rotation, target)
 }
 func fetchCurrentPullRequest(ctx context.Context, instance, token, owner, name, branch string) (int, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/current?branch=%s", instance, url.PathEscape(owner), url.PathEscape(name), url.QueryEscape(branch))

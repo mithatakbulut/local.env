@@ -89,8 +89,47 @@ docker compose -f deploy/docker/docker-compose.yml up --build
 ```
 
 The container keeps `/data` at `0700` and its SQLite database at `0600`.
-Back up the data directory before any future upgrade. The P10 backup/restore
-command will provide the supported online backup workflow.
+
+## Backup, restore, and upgrades
+
+Create a consistent backup while the server is running with the same released
+server version that currently serves the instance:
+
+```bash
+docker exec localenv localenv-server backup \
+  --output /data/backups/localenv-2026-08-15.tar.gz
+```
+
+The archive contains an online SQLite snapshot (`localenv.db`) plus the
+instance credential files when present. It contains ciphertext, never managed
+secret plaintext or a plaintext repository key. Store the archive as securely
+as the `/data` volume. The command refuses to overwrite an existing archive.
+
+To restore, stop the server, create a fresh empty `/data` volume with mode
+`0700`, extract the archive into it, and restore the exact deployment
+configuration—especially `LOCALENV_GITHUB_APP_CREDENTIALS_ENCRYPTION_KEY`.
+Then start the same local.env version and check readiness before upgrading:
+
+```bash
+docker stop localenv
+tar -xzf localenv-2026-08-15.tar.gz -C /path/to/fresh-data
+chmod 0700 /path/to/fresh-data
+chmod 0600 /path/to/fresh-data/*
+# start the container with /path/to/fresh-data mounted at /data
+curl --fail https://env.acme.com/readyz
+```
+
+Existing active devices can decrypt the restored ciphertext because their
+private age identities stay on their machines. Never restore into a live data
+directory or combine files from two instances. Before an upgrade, make a
+backup using the currently running release; startup applies only forward
+migrations and refuses a database schema newer than the binary supports.
+
+After removing a device, run `localenv keys rotate` from an active authorized
+device. It decrypts the current repository snapshot locally, creates a new
+REK epoch, re-encrypts the snapshot locally, and wraps the new REK only to
+remaining active devices. A removed device cannot decrypt the new epoch, but
+it cannot be made to forget values it previously received.
 
 ## Development checks
 

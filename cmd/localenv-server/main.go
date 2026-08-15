@@ -19,6 +19,9 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "backup" {
+		os.Exit(runBackup(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg, err := config.LoadFromEnv()

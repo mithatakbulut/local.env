@@ -275,6 +275,221 @@ func TestRepositoryCryptoBootstrapStoresOnlyWrappedREK(t *testing.T) {
 	}
 }
 
+func TestKeyRotationReencryptsCurrentSnapshotAndExcludesRevokedDevice(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	if err := store.ConfigureGitHubInstance(ctx, 2, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(ctx, RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installations(github_installation_id, created_at) VALUES (7, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installation_repositories(github_repo_id, github_installation_id, owner, name, default_branch, active, updated_at) VALUES (17, 7, 'acme', 'api', 'main', 1, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	owner := githubapp.User{ID: 41, Login: "owner"}
+	former := githubapp.User{ID: 42, Login: "former"}
+	if err := store.CreateSession(ctx, owner, "non-secret-owner-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, former, "non-secret-former-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	ownerIdentity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	formerIdentity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerDevice, err := store.RegisterDevice(ctx, "non-secret-owner-session", "device-owner", "owner laptop", ownerIdentity.Recipient().String(), "sha256:owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	formerDevice, err := store.RegisterDevice(ctx, "non-secret-former-session", "device-former", "former laptop", formerIdentity.Recipient().String(), "sha256:former")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldREK := []byte("non-secret-test-rek-sentinel-000")
+	ownerWrap, err := cryptokit.WrapREK(oldREK, ownerIdentity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.InitializeRepositoryCrypto(ctx, "acme", "api", owner.ID, ownerDevice.ID, ownerWrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	formerWrap, err := cryptokit.WrapREK(oldREK, formerIdentity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDeviceAccess(ctx, "acme", "api", owner.ID, ownerDevice.ID, mustRequestCode(t, store, ctx, former, formerDevice), formerWrap); err != nil {
+		t.Fatal(err)
+	}
+	fileID := pranalysis.FileID(17, ".env.example", ".env.local")
+	envelope, err := cryptokit.Encrypt(oldREK, []byte("rotation-non-secret-sentinel"), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Version: 1, KeyEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateBaselineSecret(ctx, "acme", "api", owner.ID, ownerDevice.ID, fileID, "DATABASE_URL", 0, SecretEnvelope(envelope)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeDevice(ctx, owner.ID, ownerDevice.ID, formerDevice.ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", owner.ID, ownerDevice.ID)
+	if err != nil || len(snapshot.Secrets) != 1 {
+		t.Fatalf("rotation snapshot = %#v, %v", snapshot, err)
+	}
+	newREK, err := cryptokit.GenerateREK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearTestBytes(newREK)
+	newOwnerWrap, err := cryptokit.WrapREK(newREK, ownerIdentity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := snapshot.Secrets[0]
+	plaintext, err := cryptokit.Decrypt(oldREK, cryptokit.Envelope(secret.Envelope), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version, KeyEpoch: secret.Envelope.KeyEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := cryptokit.Encrypt(newREK, plaintext, cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version + 1, KeyEpoch: 2})
+	clearTestBytes(plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.RotateRepositoryKey(ctx, "acme", "api", owner.ID, ownerDevice.ID, KeyRotation{ExpectedEpoch: 1, WrappedKeys: []RotationWrappedKey{{DeviceID: ownerDevice.ID, WrappedREK: newOwnerWrap}}, Secrets: []RotationSecret{{FileID: secret.FileID, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Envelope: SecretEnvelope(rotated)}}})
+	if err != nil || state.ActiveKeyEpoch != 2 {
+		t.Fatalf("RotateRepositoryKey() = %#v, %v", state, err)
+	}
+	rotatedSnapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", owner.ID, ownerDevice.ID)
+	if err != nil || rotatedSnapshot.Secrets[0].Envelope.KeyEpoch != 2 {
+		t.Fatalf("rotated snapshot = %#v, %v", rotatedSnapshot, err)
+	}
+	if _, err := cryptokit.Decrypt(oldREK, cryptokit.Envelope(rotatedSnapshot.Secrets[0].Envelope), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Version: 2, KeyEpoch: 2}); err == nil {
+		t.Fatal("former device's retained epoch-1 REK decrypted epoch-2 data")
+	}
+	if _, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", former.ID, formerDevice.ID); err == nil {
+		t.Fatal("revoked device received epoch-2 snapshot")
+	}
+}
+
+func mustRequestCode(t *testing.T, store *Store, ctx context.Context, user githubapp.User, device Device) string {
+	t.Helper()
+	request, err := store.CreateDeviceAccessRequest(ctx, "acme", "api", user.ID, device.ID, "non-secret-rotation-approval-code")
+	if err != nil || request.ID == "" {
+		t.Fatalf("CreateDeviceAccessRequest() = %#v, %v", request, err)
+	}
+	return "non-secret-rotation-approval-code"
+}
+
+func clearTestBytes(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
+}
+
+func TestOnlineBackupRestoresIntoFreshDataDirectory(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.ConfigureGitHubInstance(ctx, 2, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(ctx, RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installations(github_installation_id, created_at) VALUES (7, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installation_repositories(github_repo_id, github_installation_id, owner, name, default_branch, active, updated_at) VALUES (17, 7, 'acme', 'api', 'main', 1, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	user := githubapp.User{ID: 41, Login: "developer"}
+	if err := store.CreateSession(ctx, user, "non-secret-restore-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.RegisterDevice(ctx, "non-secret-restore-session", "device-restore", "restore laptop", identity.Recipient().String(), "sha256:restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rek := []byte("non-secret-test-rek-sentinel-000")
+	wrapped, err := cryptokit.WrapREK(rek, identity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.InitializeRepositoryCrypto(ctx, "acme", "api", user.ID, device.ID, wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileID := pranalysis.FileID(17, ".env.example", ".env.local")
+	envelope, err := cryptokit.Encrypt(rek, []byte("restore-non-secret-sentinel"), cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: 17, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Version: 1, KeyEpoch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateBaselineSecret(ctx, "acme", "api", user.ID, device.ID, fileID, "DATABASE_URL", 0, SecretEnvelope(envelope)); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(t.TempDir(), "localenv.db")
+	if err := store.BackupTo(ctx, backup); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(backup)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup permissions = %v, %v", info, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restoredDir := t.TempDir()
+	bytes, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(restoredDir, databaseFile), bytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(ctx, restoredDir)
+	if err != nil {
+		t.Fatalf("open restored database: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Close() })
+	if err := restored.Ready(ctx); err != nil {
+		t.Fatalf("restored database is not ready: %v", err)
+	}
+	snapshot, err := restored.RepositorySnapshotForDevice(ctx, "acme", "api", user.ID, device.ID)
+	if err != nil || len(snapshot.Secrets) != 1 {
+		t.Fatalf("restored snapshot = %#v, %v", snapshot, err)
+	}
+	restoredREK, err := cryptokit.UnwrapREK(identity, snapshot.WrappedREK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearTestBytes(restoredREK)
+	plaintext, err := cryptokit.Decrypt(restoredREK, cryptokit.Envelope(snapshot.Secrets[0].Envelope), cryptokit.AAD{InstanceID: snapshot.Repository.InstanceID, GitHubRepoID: snapshot.Repository.GitHubRepoID, FilePath: snapshot.Secrets[0].FilePath, KeyName: snapshot.Secrets[0].KeyName, Scope: snapshot.Secrets[0].Scope, ScopeID: snapshot.Secrets[0].ScopeID, Version: snapshot.Secrets[0].Envelope.Version, KeyEpoch: snapshot.Secrets[0].Envelope.KeyEpoch})
+	if err != nil || string(plaintext) != "restore-non-secret-sentinel" {
+		t.Fatalf("restored active-device decryption = %q, %v", plaintext, err)
+	}
+	clearTestBytes(plaintext)
+}
+
 func TestDeviceAccessApprovalRewrapsLocallyAndRevocationStopsSnapshots(t *testing.T) {
 	store, err := Open(context.Background(), t.TempDir())
 	if err != nil {
