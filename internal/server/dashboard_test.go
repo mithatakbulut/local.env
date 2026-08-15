@@ -103,6 +103,39 @@ func TestDashboardOperationalViewsUseOnlyAllowlistedMetadata(t *testing.T) {
 	}
 }
 
+func TestDashboardAuditPageViewOmitsInternalAuditIdentifiers(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	view := dashboardAuditEventViewsFor([]sqlite.AuditEvent{{
+		ID:        "internal-audit-event-id",
+		EventType: "device.revoked", ActorUserID: "private-user-id", ActorDeviceID: "device-d5", RepositoryID: "private-repository-id", CreatedAt: createdAt,
+		Metadata: map[string]string{"target_device_id": "device-d5"},
+	}})
+	encoded, err := json.Marshal(dashboardAuditPageView{Events: view, NextCursor: encodeDashboardAuditCursor(&sqlite.AuditCursor{CreatedAt: createdAt, ID: "internal-audit-event-id"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(encoded)
+	for _, forbidden := range []string{"internal-audit-event-id", "private-user-id", "private-repository-id", "ciphertext", "secret_value"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("audit page exposed forbidden data %q: %s", forbidden, body)
+		}
+	}
+	if !strings.Contains(body, `"event_type":"device.revoked"`) || !strings.Contains(body, `"target_device_id"`) {
+		t.Fatalf("audit page omitted allowlisted event data: %s", body)
+	}
+}
+
+func TestDashboardAuditCursorRoundTripsAndRejectsMalformedValues(t *testing.T) {
+	cursor := &sqlite.AuditCursor{CreatedAt: time.Date(2026, time.August, 15, 12, 0, 0, 123, time.UTC), ID: "audit-cursor-id"}
+	decoded, err := decodeDashboardAuditCursor(encodeDashboardAuditCursor(cursor))
+	if err != nil || decoded == nil || !decoded.CreatedAt.Equal(cursor.CreatedAt) || decoded.ID != cursor.ID {
+		t.Fatalf("audit cursor round trip = %#v, %v", decoded, err)
+	}
+	if _, err := decodeDashboardAuditCursor("not-a-valid-cursor"); err == nil {
+		t.Fatal("malformed audit cursor was accepted")
+	}
+}
+
 func TestDashboardSetupViewRetainsNormalCSRFProtectedHandoff(t *testing.T) {
 	view := dashboardViewForSetup(setupPage{CSRFToken: "csrf-d4-test", Organizations: []githubapp.Organization{{ID: 7, Login: "acme"}}})
 	encoded, err := json.Marshal(view)

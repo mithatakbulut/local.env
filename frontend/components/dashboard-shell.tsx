@@ -42,6 +42,11 @@ export type DashboardAuditEvent = {
   created_at: string;
 };
 
+export type DashboardAuditPage = {
+  events: DashboardAuditEvent[];
+  next_cursor?: string;
+};
+
 export type DashboardSetup = {
   state: "configuration_required" | "complete" | "sign_in" | "organization_selection" | "manifest_post";
   sign_in_url?: string;
@@ -60,6 +65,7 @@ type DashboardView = {
   pull_request?: DashboardPullRequest;
   devices: DashboardDevice[];
   audit_events: DashboardAuditEvent[];
+  audit_next_cursor?: string;
   settings?: { public_url: string };
   setup?: DashboardSetup;
   owner: string;
@@ -132,7 +138,7 @@ function isView(value: unknown): value is DashboardView {
   if (view.kind === "repository") return isRepository(view.repository);
   if (view.kind === "pull_request") return isPullRequest(view.pull_request) && typeof view.owner === "string" && typeof view.repo === "string";
   if (view.kind === "devices") return Array.isArray(view.devices) && view.devices.every(isDevice);
-  if (view.kind === "audit") return Array.isArray(view.audit_events) && view.audit_events.every(isAuditEvent);
+  if (view.kind === "audit") return Array.isArray(view.audit_events) && view.audit_events.every(isAuditEvent) && (view.audit_next_cursor === undefined || typeof view.audit_next_cursor === "string");
   if (view.kind === "settings") return Boolean(view.settings) && typeof view.settings?.public_url === "string";
   return view.kind === "setup" && isSetup(view.setup);
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,6 +109,35 @@ func TestDashboardDevicesShowsRevokedDevicesWithoutKeyMaterial(t *testing.T) {
 	}
 	if len(devices) != 1 || devices[0].ID != device.ID || devices[0].RevokedAt == nil || devices[0].HasKey {
 		t.Fatalf("dashboard devices = %#v", devices)
+	}
+}
+
+func TestDashboardAuditEventsUsesStableTwentyItemCursorPages(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	createdAt := time.Date(2026, time.August, 15, 8, 0, 0, 0, time.UTC)
+	for index := 0; index < 21; index++ {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO audit_events(id, event_type, metadata_json, created_at) VALUES (?, ?, ?, ?)`, fmt.Sprintf("audit-page-%02d", index), "device.registered", `{"device_id":"non-secret-test-device"}`, createdAt.Add(-time.Duration(index)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := store.DashboardAuditEvents(ctx, nil, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Events) != 20 || first.NextCursor == nil || first.Events[0].ID != "audit-page-00" || first.Events[19].ID != "audit-page-19" {
+		t.Fatalf("first audit page = %#v", first)
+	}
+	second, err := store.DashboardAuditEvents(ctx, first.NextCursor, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Events) != 1 || second.Events[0].ID != "audit-page-20" || second.NextCursor != nil {
+		t.Fatalf("second audit page = %#v", second)
 	}
 }
 
