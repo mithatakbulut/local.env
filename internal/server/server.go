@@ -627,7 +627,13 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GitHub sign-in failed", http.StatusBadGateway)
 		return
 	}
-	user, organizations, err := s.github.UserAndOrganizations(ctx, token)
+	var user githubapp.User
+	var organizations []githubapp.Organization
+	if state.Audience == "dashboard" {
+		user, err = s.github.AuthenticatedUser(ctx, token)
+	} else {
+		user, organizations, err = s.github.UserAndOrganizations(ctx, token)
+	}
 	if err != nil {
 		http.Error(w, "GitHub organization discovery failed", http.StatusBadGateway)
 		return
@@ -648,7 +654,12 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
 			return
 		}
-		if !memberOfOrganization(organizations, organization.ID) {
+		active, membershipErr := s.github.ActiveOrganizationMembership(ctx, token, organization.Login, user.Login)
+		if membershipErr != nil {
+			http.Error(w, "GitHub organization membership verification failed", http.StatusBadGateway)
+			return
+		}
+		if !active {
 			http.Error(w, "GitHub account "+user.Login+" does not have an active membership in the configured organization", http.StatusForbidden)
 			return
 		}

@@ -63,3 +63,25 @@ func TestHTTPErrorClassifiesSafeGitHub403ResponseHeaders(t *testing.T) {
 		t.Fatalf("ordinary 403 class = %q, want empty", got)
 	}
 }
+
+func TestActiveOrganizationMembershipDoesNotFollowRedirect(t *testing.T) {
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected = true
+	}))
+	t.Cleanup(target.Close)
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/orgs/acme/members/member" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(github.Close)
+
+	active, err := (Client{HTTPClient: github.Client(), APIBaseURL: github.URL}).ActiveOrganizationMembership(context.Background(), "non-secret-test-token", "acme", "member")
+	if err != nil || active || redirected {
+		t.Fatalf("ActiveOrganizationMembership() = (%t, %v), redirected=%t", active, err, redirected)
+	}
+}

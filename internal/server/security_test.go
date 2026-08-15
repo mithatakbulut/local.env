@@ -118,8 +118,8 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":11,"login":"outsider"}`))
-		case "/user/memberships/orgs":
-			_, _ = w.Write([]byte(`[{"state":"pending","organization":{"id":7,"login":"acme"}}]`))
+		case "/orgs/acme/members/outsider":
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -156,8 +156,8 @@ func TestDashboardLoginUsesActiveOrganizationMembership(t *testing.T) {
 			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":11,"login":"member"}`))
-		case "/user/memberships/orgs":
-			_, _ = w.Write([]byte(`[{"state":"active","organization":{"id":7,"login":"acme"}}]`))
+		case "/orgs/acme/members/member":
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
