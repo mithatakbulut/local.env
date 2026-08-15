@@ -957,6 +957,43 @@ func (s *Store) RepositorySnapshotForDevice(ctx context.Context, owner, name str
 	return result, nil
 }
 
+// PullRequestSnapshotForDevice returns the baseline snapshot plus the current
+// pending values for one open pull request. The caller still receives only
+// ciphertext and its own age-wrapped repository key.
+func (s *Store) PullRequestSnapshotForDevice(ctx context.Context, owner, name string, number int, githubUserID int64, deviceID string) (RepositorySnapshot, error) {
+	if number <= 0 {
+		return RepositorySnapshot{}, errors.New("pull request number must be positive")
+	}
+	result, err := s.RepositorySnapshotForDevice(ctx, owner, name, githubUserID, deviceID)
+	if err != nil {
+		return RepositorySnapshot{}, err
+	}
+	repositoryID, err := s.repositoryID(ctx, result.Repository.GitHubRepoID)
+	if err != nil {
+		return RepositorySnapshot{}, err
+	}
+	var state string
+	if err := s.db.QueryRowContext(ctx, `SELECT state FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, number).Scan(&state); err != nil || state != "open" {
+		return RepositorySnapshot{}, errors.New("pull request is not open")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.algorithm, sv.key_epoch, sv.nonce, sv.ciphertext, sv.version FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.scope = 'pull_request' AND sv.scope_id = ? AND sv.archived_at IS NULL AND sv.promoted_at IS NULL AND sv.version = (SELECT MAX(current.version) FROM secret_versions current WHERE current.repository_id = sv.repository_id AND current.file_id = sv.file_id AND current.key_name = sv.key_name AND current.scope = 'pull_request' AND current.scope_id = ? AND current.archived_at IS NULL) ORDER BY sv.file_id, sv.key_name`, repositoryID, strconv.Itoa(number), strconv.Itoa(number))
+	if err != nil {
+		return RepositorySnapshot{}, fmt.Errorf("list encrypted pull request snapshot: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var secret SecretSnapshot
+		if err := rows.Scan(&secret.FileID, &secret.FilePath, &secret.KeyName, &secret.Scope, &secret.ScopeID, &secret.Envelope.Algorithm, &secret.Envelope.KeyEpoch, &secret.Envelope.Nonce, &secret.Envelope.Ciphertext, &secret.Envelope.Version); err != nil {
+			return RepositorySnapshot{}, fmt.Errorf("scan encrypted pull request snapshot: %w", err)
+		}
+		result.Secrets = append(result.Secrets, secret)
+	}
+	if err := rows.Err(); err != nil {
+		return RepositorySnapshot{}, fmt.Errorf("iterate encrypted pull request snapshot: %w", err)
+	}
+	return result, nil
+}
+
 // UpdateBaselineSecret appends a locally encrypted baseline value. It is used
 // by `localenv import`; the caller must already own a wrapped active REK.
 func (s *Store) UpdateBaselineSecret(ctx context.Context, owner, name string, githubUserID int64, deviceID, fileID, keyName string, expectedVersion int64, envelope SecretEnvelope) error {

@@ -21,11 +21,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	"filippo.io/age"
 	"github.com/localenv/localenv/internal/cryptokit"
+	"github.com/localenv/localenv/internal/dotenv"
 	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/internal/repository"
 	"github.com/zalando/go-keyring"
@@ -56,6 +58,10 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runSet(args[1:], out, errOut)
 	case "import":
 		return runImport(args[1:], out, errOut)
+	case "sync":
+		return runSync(args[1:], out, errOut)
+	case "diff":
+		return runDiff(args[1:], out, errOut)
 	case "--version", "version":
 		return 0
 	case "--help", "help":
@@ -78,6 +84,331 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  resolve --pr NUMBER   Encrypt and resolve missing PR values")
 	fmt.Fprintln(out, "  set KEY --pr NUMBER   Encrypt and set one PR value")
 	fmt.Fprintln(out, "  import FILE           Encrypt declared values from a local dotenv file")
+	fmt.Fprintln(out, "  sync                  Download, decrypt, and safely update local dotenv files")
+	fmt.Fprintln(out, "  diff                  Show key-level local/remote dotenv differences")
+}
+
+func runSync(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("sync", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	pr := flags.Int("pr", 0, "include pending values from this pull request")
+	dryRun := flags.Bool("dry-run", false, "show key-level changes without writing files")
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *pr < 0 {
+		fmt.Fprintln(errOut, "Usage: localenv sync [--pr NUMBER] [--dry-run] [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	remote, root, err := syncSnapshot(*repositoryFlag, *instanceFlag, *credentialFile, *pr)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not download and decrypt the repository snapshot")
+		return 1
+	}
+	if err := applySnapshot(root, remote, *dryRun, out, errOut); err != nil {
+		fmt.Fprintln(errOut, "localenv: could not safely synchronize local dotenv files")
+		return 1
+	}
+	if *dryRun {
+		fmt.Fprintln(out, "Dry run complete; no local dotenv files were changed.")
+	} else {
+		fmt.Fprintln(out, "Local environment synchronized.")
+	}
+	return 0
+}
+
+func runDiff(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("diff", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	pr := flags.Int("pr", 0, "include pending values from this pull request")
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *pr < 0 {
+		fmt.Fprintln(errOut, "Usage: localenv diff [--pr NUMBER] [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	remote, root, err := syncSnapshot(*repositoryFlag, *instanceFlag, *credentialFile, *pr)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not download and decrypt the repository snapshot")
+		return 1
+	}
+	if err := diffSnapshot(root, remote, out); err != nil {
+		fmt.Fprintln(errOut, "localenv: could not safely inspect local dotenv files")
+		return 1
+	}
+	return 0
+}
+
+type decryptedSnapshot map[string]map[string][]byte // target path -> key -> value
+
+func syncSnapshot(repositoryFlag, instanceFlag, credentialFile string, pr int) (decryptedSnapshot, string, error) {
+	secrets, err := credentialStore(credentialFile)
+	if err != nil {
+		return nil, "", err
+	}
+	instance, token, err := currentSession(secrets, instanceFlag)
+	if err != nil {
+		return nil, "", err
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		return nil, "", err
+	}
+	gitIdentity, err := repository.Detect(context.Background(), ".")
+	if err != nil {
+		return nil, "", err
+	}
+	owner, name := gitIdentity.Owner, gitIdentity.Name
+	if repositoryFlag != "" {
+		owner, name, err = selectedRepository(repositoryFlag)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	contract, err := repository.LoadSnapshot(gitIdentity.Root)
+	if err != nil {
+		return nil, "", err
+	}
+	if pr == 0 && gitIdentity.Branch != "" {
+		pr, err = fetchCurrentPullRequest(context.Background(), instance, token, owner, name, gitIdentity.Branch)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	var snapshot apiRepositorySnapshot
+	if pr > 0 {
+		snapshot, err = fetchPullRequestSnapshot(context.Background(), instance, token, owner, name, pr)
+	} else {
+		snapshot, err = fetchRepositorySnapshot(context.Background(), instance, token, owner, name)
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	rek, err := cryptokit.UnwrapREK(identity.Identity, snapshot.WrappedREK)
+	if err != nil {
+		return nil, "", err
+	}
+	defer clear(rek)
+	files := make(map[string]repository.SchemaFile, len(contract.Files))
+	for _, file := range contract.Files {
+		files[pranalysis.FileID(snapshot.Repository.GitHubRepoID, file.Schema, file.Target)] = file
+	}
+	result := make(decryptedSnapshot)
+	for _, file := range contract.Files {
+		result[file.Target] = make(map[string][]byte)
+	}
+	for _, secret := range snapshot.Secrets {
+		file, exists := files[secret.FileID]
+		if !exists || secret.FilePath != file.Target || !containsKey(file.Keys, secret.KeyName) {
+			continue // old/replaced contracts must not write a current local file.
+		}
+		value, err := cryptokit.Decrypt(rek, secret.Envelope, cryptokit.AAD{InstanceID: snapshot.Repository.InstanceID, GitHubRepoID: snapshot.Repository.GitHubRepoID, FilePath: secret.FilePath, KeyName: secret.KeyName, Scope: secret.Scope, ScopeID: secret.ScopeID, Version: secret.Envelope.Version, KeyEpoch: secret.Envelope.KeyEpoch})
+		if err != nil {
+			clearSnapshot(result)
+			return nil, "", err
+		}
+		if result[file.Target] == nil {
+			result[file.Target] = make(map[string][]byte)
+		}
+		// Pending PR values are returned after baseline values and deliberately
+		// override them for an explicit --pr sync.
+		if previous := result[file.Target][secret.KeyName]; previous != nil {
+			clear(previous)
+		}
+		result[file.Target][secret.KeyName] = value
+	}
+	return result, gitIdentity.Root, nil
+}
+
+func applySnapshot(root string, remote decryptedSnapshot, dryRun bool, out, errOut io.Writer) error {
+	defer clearSnapshot(remote)
+	for _, target := range sortedTargets(remote) {
+		path, err := safeLocalTarget(root, target)
+		if err != nil {
+			return err
+		}
+		source, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		targetExists := err == nil
+		if errors.Is(err, os.ErrNotExist) {
+			source = nil
+		}
+		change, err := dotenv.UpdateManaged(source, remote[target])
+		if err != nil {
+			return err
+		}
+		if ignored, err := gitIgnored(root, target); err != nil {
+			return err
+		} else if !ignored {
+			fmt.Fprintf(errOut, "localenv: warning: %s is not covered by .gitignore\n", target)
+		}
+		if !change.Changed {
+			if !dryRun && targetExists {
+				if err := os.Chmod(path, 0o600); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintf(out, "%s: already up to date\n", target)
+			continue
+		}
+		printChange(out, target, change, dryRun)
+		if dryRun {
+			continue
+		}
+		if err := atomicWrite0600(path, change.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func diffSnapshot(root string, remote decryptedSnapshot, out io.Writer) error {
+	defer clearSnapshot(remote)
+	for _, target := range sortedTargets(remote) {
+		path, err := safeLocalTarget(root, target)
+		if err != nil {
+			return err
+		}
+		source, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			source = nil
+		}
+		change, err := dotenv.UpdateManaged(source, remote[target])
+		if err != nil {
+			return err
+		}
+		developerKeys, err := dotenv.DeveloperKeys(source)
+		if err != nil {
+			return err
+		}
+		for _, key := range change.Updated {
+			fmt.Fprintf(out, "Remote newer: %s: %s\n", target, key)
+		}
+		for _, key := range change.Added {
+			fmt.Fprintf(out, "Missing locally: %s: %s\n", target, key)
+		}
+		for _, key := range sortedKeys(developerKeys) {
+			fmt.Fprintf(out, "Local-only: %s: %s\n", target, key)
+		}
+	}
+	return nil
+}
+
+func safeLocalTarget(root, target string) (string, error) {
+	if target == "" || filepath.IsAbs(target) || filepath.Clean(target) != target || strings.HasPrefix(target, ".."+string(filepath.Separator)) {
+		return "", errors.New("invalid configured local target")
+	}
+	path := filepath.Join(root, filepath.FromSlash(target))
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil || !withinRoot(root, parent) {
+		return "", errors.New("local target directory is unsafe")
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("local target must not be a symlink")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return path, nil
+}
+
+func withinRoot(root, candidate string) bool {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(resolvedRoot, candidate)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+func atomicWrite0600(path string, content []byte) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), ".localenv-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0o600); err == nil {
+		_, err = temp.Write(content)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
+}
+
+func gitIgnored(root, target string) (bool, error) {
+	command := exec.Command("git", "-C", root, "check-ignore", "-q", "--", filepath.FromSlash(target))
+	err := command.Run()
+	if err == nil {
+		return true, nil
+	}
+	if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+func printChange(out io.Writer, target string, change dotenv.ManagedResult, dryRun bool) {
+	prefix := ""
+	if dryRun {
+		prefix = "Would "
+	}
+	for _, key := range change.Added {
+		fmt.Fprintf(out, "%sadd: %s: %s\n", prefix, target, key)
+	}
+	for _, key := range change.Updated {
+		fmt.Fprintf(out, "%supdate: %s: %s\n", prefix, target, key)
+	}
+	for _, key := range change.Removed {
+		fmt.Fprintf(out, "%sremove: %s: %s\n", prefix, target, key)
+	}
+}
+
+func sortedTargets(values decryptedSnapshot) []string {
+	result := make([]string, 0, len(values))
+	for target := range values {
+		result = append(result, target)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sortedKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for key := range values {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func containsKey(keys []string, expected string) bool {
+	for _, key := range keys {
+		if key == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func clearSnapshot(snapshot decryptedSnapshot) {
+	for _, values := range snapshot {
+		for _, value := range values {
+			clear(value)
+		}
+	}
 }
 
 func runImport(args []string, out, errOut io.Writer) int {
@@ -868,8 +1199,10 @@ type apiPullRequirements struct {
 
 type apiSecretSnapshot struct {
 	FileID   string             `json:"file_id"`
+	FilePath string             `json:"file_path"`
 	KeyName  string             `json:"key_name"`
 	Scope    string             `json:"scope"`
+	ScopeID  string             `json:"scope_id"`
 	Envelope cryptokit.Envelope `json:"envelope"`
 }
 
@@ -903,6 +1236,37 @@ func fetchPullRequirements(ctx context.Context, instance, token, owner, name str
 func fetchRepositorySnapshot(ctx context.Context, instance, token, owner, name string) (apiRepositorySnapshot, error) {
 	var result apiRepositorySnapshot
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/snapshot", instance, url.PathEscape(owner), url.PathEscape(name))
+	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
+}
+func fetchCurrentPullRequest(ctx context.Context, instance, token, owner, name, branch string) (int, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/current?branch=%s", instance, url.PathEscape(owner), url.PathEscape(name), url.QueryEscape(branch))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := (&http.Client{Timeout: 20 * time.Second}).Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNoContent {
+		return 0, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return 0, errors.New("current pull request lookup failed")
+	}
+	var result struct {
+		Number int `json:"number"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 32<<10)).Decode(&result); err != nil || result.Number <= 0 {
+		return 0, errors.New("current pull request lookup failed")
+	}
+	return result.Number, nil
+}
+func fetchPullRequestSnapshot(ctx context.Context, instance, token, owner, name string, number int) (apiRepositorySnapshot, error) {
+	var result apiRepositorySnapshot
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/snapshot", instance, url.PathEscape(owner), url.PathEscape(name), number)
 	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
 }
 func requestJSON(ctx context.Context, method, endpoint, token string, payload, target any) error {

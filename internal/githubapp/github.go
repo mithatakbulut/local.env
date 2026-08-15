@@ -262,6 +262,51 @@ func (c Client) HasRepositoryWriteAccess(ctx context.Context, credentials Creden
 	return result.Permission == "admin" || result.Permission == "maintain" || result.Permission == "write", nil
 }
 
+// OpenPullRequestNumber returns the unique open pull request whose head ref
+// matches branch. It uses the installation token and returns zero when no
+// matching PR exists; no source contents or secret data are requested.
+func (c Client) OpenPullRequestNumber(ctx context.Context, credentials Credentials, installationID int64, owner, repository, branch string) (int, error) {
+	if installationID <= 0 || !validGitHubLogin(owner) || !validGitHubLogin(repository) || strings.TrimSpace(branch) == "" || len(branch) > 255 {
+		return 0, errors.New("incomplete pull request lookup")
+	}
+	token, err := c.installationToken(ctx, credentials, installationID)
+	if err != nil {
+		return 0, err
+	}
+	endpoint := c.apiURL("repos", owner, repository, "pulls") + "?state=open&per_page=100"
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	response, err := c.authorized(request, token)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("GitHub pull request lookup returned status %d", response.StatusCode)
+	}
+	var pulls []struct {
+		Number int `json:"number"`
+		Head   struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
+	}
+	if err := decodeJSON(response.Body, &pulls); err != nil {
+		return 0, errors.New("decode GitHub pull request lookup")
+	}
+	matched := 0
+	for _, pull := range pulls {
+		if pull.Number > 0 && pull.Head.Ref == branch {
+			if matched != 0 {
+				return 0, errors.New("multiple open pull requests match this branch")
+			}
+			matched = pull.Number
+		}
+	}
+	return matched, nil
+}
+
 // ReadinessPublication identifies the remote artifacts that must be updated,
 // rather than recreated, for a PR.
 type ReadinessPublication struct {

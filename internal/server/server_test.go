@@ -140,6 +140,8 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
 		case "/repos/acme/api/collaborators/developer/permission":
 			_, _ = w.Write([]byte(`{"permission":"` + permission + `"}`))
+		case "/repos/acme/api/pulls":
+			_, _ = w.Write([]byte(`[{"number":100,"head":{"ref":"feature/sync"}}]`))
 		case "/repos/acme/api/check-runs":
 			_, _ = w.Write([]byte(`{"id":101}`))
 		case "/repos/acme/api/issues/100/comments":
@@ -209,6 +211,13 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 	if postRecorder.Code != http.StatusCreated || strings.Contains(postRecorder.Body.String(), string(rek)) {
 		t.Fatalf("bootstrap init = %d, %s", postRecorder.Code, postRecorder.Body.String())
 	}
+	currentPull := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api/pulls/current?branch=feature%2Fsync", nil)
+	currentPull.Header.Set("Authorization", "Bearer "+token)
+	currentPullRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(currentPullRecorder, currentPull)
+	if currentPullRecorder.Code != http.StatusOK || !strings.Contains(currentPullRecorder.Body.String(), `"number":100`) {
+		t.Fatalf("current pull lookup = %d, %s", currentPullRecorder.Code, currentPullRecorder.Body.String())
+	}
 	cryptoState, err := store.RepositoryCryptoState(ctx, "acme", "api")
 	if err != nil {
 		t.Fatal(err)
@@ -236,6 +245,13 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 	app.Handler().ServeHTTP(updated, update)
 	if updated.Code != http.StatusOK || strings.Contains(updated.Body.String(), "non-secret-pr-value") {
 		t.Fatalf("encrypted PR update = %d, %s", updated.Code, updated.Body.String())
+	}
+	pendingSnapshotRequest := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api/pulls/100/snapshot", nil)
+	pendingSnapshotRequest.Header.Set("Authorization", "Bearer "+token)
+	pendingSnapshot := httptest.NewRecorder()
+	app.Handler().ServeHTTP(pendingSnapshot, pendingSnapshotRequest)
+	if pendingSnapshot.Code != http.StatusOK || strings.Contains(pendingSnapshot.Body.String(), "non-secret-pr-value") || !strings.Contains(pendingSnapshot.Body.String(), `"scope":"pull_request"`) {
+		t.Fatalf("pending encrypted snapshot = %d, %s", pendingSnapshot.Code, pendingSnapshot.Body.String())
 	}
 	requirements, err := store.PullRequestRequirements(ctx, 17, 100)
 	if err != nil || len(requirements) != 1 || requirements[0].State != pranalysis.StateReady {
