@@ -914,6 +914,28 @@ func (s *Store) DiscoveredRepositories(ctx context.Context) ([]githubapp.Reposit
 	return repositories, nil
 }
 
+// DiscoveredRepository returns the active installation metadata needed to
+// validate and activate a repository contract before its first key bootstrap.
+func (s *Store) DiscoveredRepository(ctx context.Context, owner, name string) (githubapp.Repository, int64, error) {
+	if !validRepositoryName(owner) || !validRepositoryName(name) {
+		return githubapp.Repository{}, 0, ErrRepositoryNotManaged
+	}
+	var repository githubapp.Repository
+	var installationID int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT github_repo_id, owner, name, default_branch, github_installation_id
+		FROM github_installation_repositories
+		WHERE owner = ? AND name = ? AND active = 1`, owner, name).Scan(
+		&repository.GitHubRepoID, &repository.Owner, &repository.Name, &repository.DefaultBranch, &installationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return githubapp.Repository{}, 0, ErrRepositoryNotManaged
+	}
+	if err != nil {
+		return githubapp.Repository{}, 0, fmt.Errorf("read discovered repository: %w", err)
+	}
+	return repository, installationID, nil
+}
+
 // SaveRepositoryConfigSnapshot atomically replaces an activated repository's
 // file contract. It stores paths only; dotenv contents are never accepted.
 func (s *Store) SaveRepositoryConfigSnapshot(ctx context.Context, snapshot RepositoryConfigSnapshot) error {

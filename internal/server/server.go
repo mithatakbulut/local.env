@@ -19,8 +19,10 @@ import (
 
 	"filippo.io/age"
 	"github.com/localenv/localenv/internal/config"
+	"github.com/localenv/localenv/internal/dotenv"
 	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/pranalysis"
+	"github.com/localenv/localenv/internal/repository"
 	"github.com/localenv/localenv/internal/store/sqlite"
 )
 
@@ -70,6 +72,11 @@ type repositoryCryptoStore interface {
 	RepositoryCryptoState(context.Context, string, string) (sqlite.RepositoryCryptoState, error)
 	InitializeRepositoryCrypto(context.Context, string, string, int64, string, []byte) (sqlite.RepositoryCryptoState, error)
 	RotateRepositoryKey(context.Context, string, string, int64, string, sqlite.KeyRotation) (sqlite.RepositoryCryptoState, error)
+}
+
+type repositoryActivationStore interface {
+	DiscoveredRepository(context.Context, string, string) (githubapp.Repository, int64, error)
+	SaveRepositoryConfigSnapshot(context.Context, sqlite.RepositoryConfigSnapshot) error
 }
 
 type encryptedSecretStore interface {
@@ -961,7 +968,7 @@ func (s *Server) repositoryCryptoState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "repository bootstrap persistence is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	state, err := store.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	state, err := s.ensureRepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"), store)
 	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
 		http.NotFound(w, r)
 		return
@@ -988,7 +995,7 @@ func (s *Server) initializeRepositoryCrypto(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "repository bootstrap persistence is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	state, err := store.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	state, err := s.ensureRepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"), store)
 	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
 		http.NotFound(w, r)
 		return
@@ -1016,6 +1023,51 @@ func (s *Server) initializeRepositoryCrypto(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusCreated, initialized)
+}
+
+// ensureRepositoryCryptoState activates an installed repository from its
+// committed default-branch contract exactly when the first CLI bootstrap
+// needs it. Only public paths and schema key syntax are persisted.
+func (s *Server) ensureRepositoryCryptoState(ctx context.Context, owner, name string, stateStore repositoryCryptoStore) (sqlite.RepositoryCryptoState, error) {
+	state, err := stateStore.RepositoryCryptoState(ctx, owner, name)
+	if !errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		return state, err
+	}
+	activationStore, ok := s.store.(repositoryActivationStore)
+	if !ok {
+		return sqlite.RepositoryCryptoState{}, err
+	}
+	discovered, installationID, err := activationStore.DiscoveredRepository(ctx, owner, name)
+	if err != nil {
+		return sqlite.RepositoryCryptoState{}, err
+	}
+	credentials, configured, err := s.credentials.Load()
+	if err != nil || !configured {
+		return sqlite.RepositoryCryptoState{}, errors.New("GitHub App credentials are unavailable")
+	}
+	contractSource, err := s.github.ReadFile(ctx, credentials, installationID, discovered.Owner, discovered.Name, "localenv.yaml", discovered.DefaultBranch)
+	if err != nil {
+		return sqlite.RepositoryCryptoState{}, fmt.Errorf("read repository contract: %w", err)
+	}
+	contract, err := repository.ParseConfig(contractSource)
+	if err != nil {
+		return sqlite.RepositoryCryptoState{}, fmt.Errorf("parse repository contract: %w", err)
+	}
+	files := make([]sqlite.RepositoryFile, 0, len(contract.Files))
+	for _, file := range contract.Files {
+		schema, err := s.github.ReadFile(ctx, credentials, installationID, discovered.Owner, discovered.Name, file.Schema, discovered.DefaultBranch)
+		if err != nil {
+			return sqlite.RepositoryCryptoState{}, fmt.Errorf("read repository schema: %w", err)
+		}
+		if _, err := dotenv.ParseSchema(schema); err != nil {
+			return sqlite.RepositoryCryptoState{}, fmt.Errorf("parse repository schema: %w", err)
+		}
+		files = append(files, sqlite.RepositoryFile{SchemaPath: file.Schema, TargetPath: file.Target})
+	}
+	if err := activationStore.SaveRepositoryConfigSnapshot(ctx, sqlite.RepositoryConfigSnapshot{GitHubRepoID: discovered.GitHubRepoID, Owner: discovered.Owner, Name: discovered.Name, DefaultBranch: discovered.DefaultBranch, Files: files}); err != nil {
+		return sqlite.RepositoryCryptoState{}, fmt.Errorf("activate repository contract: %w", err)
+	}
+	return stateStore.RepositoryCryptoState(ctx, discovered.Owner, discovered.Name)
 }
 
 func (s *Server) authorizeRepository(w http.ResponseWriter, r *http.Request, state sqlite.RepositoryCryptoState, user githubapp.User) bool {

@@ -179,6 +179,28 @@ func TestSecondDeveloperSyncDecryptsMergedSnapshotWithoutChangingLocalContent(t 
 	}
 }
 
+func TestDeviceIdentityUsesDeviceRegistrationPayloadNames(t *testing.T) {
+	encoded, err := json.Marshal(deviceIdentity{
+		ID:          "device-test-id",
+		Name:        "test device",
+		Recipient:   "age1testrecipient",
+		Fingerprint: "sha256:0000000000000000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["public_recipient"] != "age1testrecipient" || payload["id"] != "device-test-id" || payload["name"] != "test device" || payload["fingerprint"] != "sha256:0000000000000000" {
+		t.Fatalf("device registration payload = %#v", payload)
+	}
+	if _, found := payload["Recipient"]; found {
+		t.Fatalf("device registration payload used Go field name: %#v", payload)
+	}
+}
+
 func TestRuntimeHelperProcess(t *testing.T) {
 	if os.Getenv("LOCALENV_RUNTIME_HELPER") != "1" {
 		return

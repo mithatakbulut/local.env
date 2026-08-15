@@ -140,6 +140,10 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
 		case "/repos/acme/api/collaborators/developer/permission", "/repos/acme/api/collaborators/new-developer/permission":
 			_, _ = w.Write([]byte(`{"permission":"` + permission + `"}`))
+		case "/repos/acme/api/contents/localenv.yaml":
+			_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"dmVyc2lvbjogMQpmaWxlczoKICAtIHNjaGVtYTogLmVudi5leGFtcGxlCiAgICB0YXJnZXQ6IC5lbnYubG9jYWwK"}`))
+		case "/repos/acme/api/contents/.env.example":
+			_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"REFUQUJBU0VfVVJMPQo="}`))
 		case "/repos/acme/api/pulls":
 			_, _ = w.Write([]byte(`[{"number":100,"head":{"ref":"feature/sync"}}]`))
 		case "/repos/acme/api/check-runs":
@@ -158,9 +162,6 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 	t.Cleanup(func() { _ = store.Close() })
 	ctx := context.Background()
 	if err := store.ConfigureGitHubInstance(ctx, 2, "acme", 9, "https://env.example.test", "local.env"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SaveRepositoryConfigSnapshot(ctx, sqlite.RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []sqlite.RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ProcessGitHubWebhook(ctx, githubapp.WebhookEvent{DeliveryID: "installation-1", EventType: "installation", InstallationID: 7, InstallationOrgID: 2, InstallationOrgLogin: "acme", RepositoriesAdded: []githubapp.Repository{{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main"}}}); err != nil {

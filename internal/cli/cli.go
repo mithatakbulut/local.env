@@ -1563,8 +1563,11 @@ func (s *fileStore) Delete(key string) error {
 }
 
 type deviceIdentity struct {
-	ID, Name, Recipient, Fingerprint string
-	Identity                         *age.X25519Identity
+	ID          string              `json:"id"`
+	Name        string              `json:"name"`
+	Recipient   string              `json:"public_recipient"`
+	Fingerprint string              `json:"fingerprint"`
+	Identity    *age.X25519Identity `json:"-"`
 }
 
 func loadOrCreateIdentity(store secretStore, instance string) (deviceIdentity, error) {
