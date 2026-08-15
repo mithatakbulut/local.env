@@ -63,3 +63,58 @@ func TestOpenRefusesDatabaseNewerThanCompiledMigrations(t *testing.T) {
 		t.Fatal("Open() succeeded with a newer database schema")
 	}
 }
+
+func TestRepositoryConfigSnapshotPersistsOnlyFileMappings(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	snapshot := RepositoryConfigSnapshot{
+		GitHubRepoID:  42,
+		Owner:         "acme",
+		Name:          "api",
+		DefaultBranch: "main",
+		Files: []RepositoryFile{
+			{SchemaPath: ".env.example", TargetPath: ".env.local"},
+			{SchemaPath: "apps/web/.env.example", TargetPath: "apps/web/.env.local"},
+		},
+	}
+	if err := store.SaveRepositoryConfigSnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("SaveRepositoryConfigSnapshot() error = %v", err)
+	}
+	got, err := store.RepositoryConfigSnapshot(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("RepositoryConfigSnapshot() error = %v", err)
+	}
+	if got.GitHubRepoID != snapshot.GitHubRepoID || got.Owner != snapshot.Owner || got.Name != snapshot.Name || got.DefaultBranch != snapshot.DefaultBranch || len(got.Files) != 2 {
+		t.Errorf("stored snapshot = %#v, want repository metadata and two mappings", got)
+	}
+
+	snapshot.Files = []RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}
+	if err := store.SaveRepositoryConfigSnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("replace config snapshot: %v", err)
+	}
+	got, err = store.RepositoryConfigSnapshot(context.Background(), 42)
+	if err != nil || len(got.Files) != 1 {
+		t.Fatalf("replaced snapshot = %#v, %v; want one mapping", got, err)
+	}
+}
+
+func TestRepositoryConfigSnapshotRejectsEscapingPath(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	err = store.SaveRepositoryConfigSnapshot(context.Background(), RepositoryConfigSnapshot{
+		GitHubRepoID:  1,
+		Owner:         "acme",
+		Name:          "api",
+		DefaultBranch: "main",
+		Files:         []RepositoryFile{{SchemaPath: "../.env.example", TargetPath: ".env.local"}},
+	})
+	if err == nil {
+		t.Fatal("SaveRepositoryConfigSnapshot() accepted escaping path")
+	}
+}

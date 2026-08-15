@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,6 +25,23 @@ const databaseFile = "localenv.db"
 // pragmas (notably foreign_keys) consistently enabled for this small v1 server.
 type Store struct {
 	db *sql.DB
+}
+
+// RepositoryConfigSnapshot is the ciphertext-free, validated repository
+// contract that P2 persists. Schema values and secret values have no field in
+// this type by design.
+type RepositoryConfigSnapshot struct {
+	GitHubRepoID  int64
+	Owner         string
+	Name          string
+	DefaultBranch string
+	Files         []RepositoryFile
+}
+
+// RepositoryFile is one schema-to-local-file mapping from localenv.yaml.
+type RepositoryFile struct {
+	SchemaPath string
+	TargetPath string
 }
 
 // Open creates the data directory and database with restrictive permissions,
@@ -314,6 +332,100 @@ func (s *Store) DiscoveredRepositories(ctx context.Context) ([]githubapp.Reposit
 		return nil, fmt.Errorf("iterate discovered GitHub repositories: %w", err)
 	}
 	return repositories, nil
+}
+
+// SaveRepositoryConfigSnapshot atomically replaces an activated repository's
+// file contract. It stores paths only; dotenv contents are never accepted.
+func (s *Store) SaveRepositoryConfigSnapshot(ctx context.Context, snapshot RepositoryConfigSnapshot) error {
+	if err := validateRepositoryConfigSnapshot(snapshot); err != nil {
+		return err
+	}
+	repositoryID := fmt.Sprintf("github:%d", snapshot.GitHubRepoID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin repository configuration snapshot: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO repositories(id, github_repo_id, owner, name, default_branch, active_key_epoch, created_at)
+		VALUES (?, ?, ?, ?, ?, 0, ?)
+		ON CONFLICT(github_repo_id) DO UPDATE SET
+			owner = excluded.owner,
+			name = excluded.name,
+			default_branch = excluded.default_branch`,
+		repositoryID, snapshot.GitHubRepoID, snapshot.Owner, snapshot.Name, snapshot.DefaultBranch, time.Now().UTC()); err != nil {
+		return fmt.Errorf("store repository configuration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repo_files WHERE repository_id = ?`, repositoryID); err != nil {
+		return fmt.Errorf("clear repository file configuration: %w", err)
+	}
+	for index, file := range snapshot.Files {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO repo_files(id, repository_id, schema_path, target_path) VALUES (?, ?, ?, ?)`, fmt.Sprintf("%s:file:%d", repositoryID, index), repositoryID, file.SchemaPath, file.TargetPath); err != nil {
+			return fmt.Errorf("store repository file configuration: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit repository configuration snapshot: %w", err)
+	}
+	return nil
+}
+
+// RepositoryConfigSnapshot returns the last validated contract for a managed
+// repository. It cannot return dotenv values because none are stored.
+func (s *Store) RepositoryConfigSnapshot(ctx context.Context, githubRepoID int64) (RepositoryConfigSnapshot, error) {
+	if githubRepoID <= 0 {
+		return RepositoryConfigSnapshot{}, errors.New("GitHub repository ID must be positive")
+	}
+	var snapshot RepositoryConfigSnapshot
+	var repositoryID string
+	err := s.db.QueryRowContext(ctx, `SELECT id, github_repo_id, owner, name, default_branch FROM repositories WHERE github_repo_id = ?`, githubRepoID).Scan(&repositoryID, &snapshot.GitHubRepoID, &snapshot.Owner, &snapshot.Name, &snapshot.DefaultBranch)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RepositoryConfigSnapshot{}, errors.New("repository configuration snapshot not found")
+		}
+		return RepositoryConfigSnapshot{}, fmt.Errorf("read repository configuration: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT schema_path, target_path FROM repo_files WHERE repository_id = ? ORDER BY schema_path, target_path`, repositoryID)
+	if err != nil {
+		return RepositoryConfigSnapshot{}, fmt.Errorf("list repository file configuration: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var file RepositoryFile
+		if err := rows.Scan(&file.SchemaPath, &file.TargetPath); err != nil {
+			return RepositoryConfigSnapshot{}, fmt.Errorf("scan repository file configuration: %w", err)
+		}
+		snapshot.Files = append(snapshot.Files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return RepositoryConfigSnapshot{}, fmt.Errorf("iterate repository file configuration: %w", err)
+	}
+	return snapshot, nil
+}
+
+func validateRepositoryConfigSnapshot(snapshot RepositoryConfigSnapshot) error {
+	if snapshot.GitHubRepoID <= 0 || strings.TrimSpace(snapshot.Owner) == "" || strings.TrimSpace(snapshot.Name) == "" || strings.TrimSpace(snapshot.DefaultBranch) == "" {
+		return errors.New("repository configuration snapshot is incomplete")
+	}
+	if len(snapshot.Files) == 0 {
+		return errors.New("repository configuration snapshot has no files")
+	}
+	seen := make(map[string]struct{}, len(snapshot.Files))
+	for _, file := range snapshot.Files {
+		if !validRepositoryRelativePath(file.SchemaPath) || !validRepositoryRelativePath(file.TargetPath) {
+			return errors.New("repository configuration snapshot has an incomplete file mapping")
+		}
+		key := file.SchemaPath + "\x00" + file.TargetPath
+		if _, duplicate := seen[key]; duplicate {
+			return errors.New("repository configuration snapshot has duplicate file mappings")
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func validRepositoryRelativePath(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value && !strings.HasPrefix(value, "/") && !strings.Contains(value, "\\") && path.Clean(value) == value && value != "." && value != ".." && !strings.HasPrefix(value, "../")
 }
 
 // Close closes the database connection.

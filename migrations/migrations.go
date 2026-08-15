@@ -10,4 +10,4 @@ var FS embed.FS
 
 // Names is the ordered, append-only migration list. Schema downgrades are not
 // supported by the server.
-var Names = []string{"001_initial.sql", "002_github_setup.sql"}
+var Names = []string{"001_initial.sql", "002_github_setup.sql", "003_repository_contract.sql"}
