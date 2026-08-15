@@ -30,6 +30,8 @@ const databaseFile = "localenv.db"
 var (
 	ErrRepositoryNotManaged         = errors.New("repository is not managed")
 	ErrRepositoryAlreadyInitialized = errors.New("repository encryption is already initialized")
+	ErrSecretVersionConflict        = errors.New("secret version conflict")
+	ErrPullRequestNotOpen           = errors.New("pull request is not open")
 )
 
 // Store owns a single SQLite connection. A single connection keeps connection
@@ -68,6 +70,53 @@ type RepositoryCryptoState struct {
 	ActiveKeyEpoch int64  `json:"active_key_epoch"`
 	InstallationID int64  `json:"-"`
 	Initialized    bool   `json:"initialized"`
+}
+
+// SecretEnvelope is the opaque ciphertext record accepted by the server. It
+// has deliberately no plaintext field; clients construct it after local AEAD
+// encryption.
+type SecretEnvelope struct {
+	Algorithm  string `json:"algorithm"`
+	KeyEpoch   int64  `json:"key_epoch"`
+	Nonce      []byte `json:"nonce"`
+	Ciphertext []byte `json:"ciphertext"`
+	Version    int64  `json:"version"`
+}
+
+// PullRequirement is the public metadata a CLI needs to encrypt a missing PR
+// value with the next immutable version number.
+type PullRequirement struct {
+	FileID         string `json:"file_id"`
+	FilePath       string `json:"file_path"`
+	KeyName        string `json:"key_name"`
+	State          string `json:"state"`
+	CurrentVersion int64  `json:"current_version"`
+}
+
+// PullRequirementsResponse includes the requesting device's age-wrapped REK,
+// never a plaintext REK or plaintext secret value.
+type PullRequirementsResponse struct {
+	Repository   RepositoryCryptoState `json:"repository"`
+	PullRequest  githubapp.PullRequest `json:"pull_request"`
+	WrappedREK   []byte                `json:"wrapped_rek"`
+	Requirements []PullRequirement     `json:"requirements"`
+}
+
+// SecretSnapshot is an opaque, decryptable-only-on-device secret record.
+// Scope fields are returned because they are authenticated AAD inputs.
+type SecretSnapshot struct {
+	FileID   string         `json:"file_id"`
+	FilePath string         `json:"file_path"`
+	KeyName  string         `json:"key_name"`
+	Scope    string         `json:"scope"`
+	ScopeID  string         `json:"scope_id"`
+	Envelope SecretEnvelope `json:"envelope"`
+}
+
+type RepositorySnapshot struct {
+	Repository RepositoryCryptoState `json:"repository"`
+	WrappedREK []byte                `json:"wrapped_rek"`
+	Secrets    []SecretSnapshot      `json:"secrets"`
 }
 
 // CreateAuthExchange records a one-time, short-lived CLI exchange code by
@@ -651,9 +700,20 @@ func (s *Store) SavePullRequestRequirements(ctx context.Context, pull githubapp.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM pr_requirements WHERE repository_id = ? AND pr_number = ?`, repositoryID, pull.Number); err != nil {
 		return PullRequestReadiness{}, fmt.Errorf("clear PR requirements: %w", err)
 	}
-	for _, requirement := range requirements {
+	for index := range requirements {
+		requirement := requirements[index]
 		if !validRequirement(requirement) {
 			return PullRequestReadiness{}, errors.New("invalid PR requirement")
+		}
+		if requirement.State == pranalysis.StateMissing {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM secret_versions WHERE repository_id = ? AND file_id = ? AND key_name = ? AND scope = 'pull_request' AND scope_id = ? AND archived_at IS NULL)`, repositoryID, requirement.FileID, requirement.KeyName, strconv.Itoa(pull.Number)).Scan(&exists); err != nil {
+				return PullRequestReadiness{}, fmt.Errorf("check PR secret resolution: %w", err)
+			}
+			if exists {
+				requirement.State = pranalysis.StateReady
+				requirements[index] = requirement
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO pr_requirements(repository_id, pr_number, file_id, key_name, requirement_state) VALUES (?, ?, ?, ?, ?)`, repositoryID, pull.Number, requirement.FileID, requirement.KeyName, requirement.State); err != nil {
 			return PullRequestReadiness{}, fmt.Errorf("store PR requirement: %w", err)
@@ -671,14 +731,21 @@ func (s *Store) SavePullRequestRequirements(ctx context.Context, pull githubapp.
 	return result, nil
 }
 
-// ClosePullRequest records GitHub's terminal PR state. There are no pending
-// secrets in P3, so it never promotes, archives, or deletes secret data.
+// ClosePullRequest atomically promotes the current pending ciphertext for new
+// baseline keys on merge, or archives pending ciphertext when a PR closes
+// unmerged. Promotion preserves the original PR AAD identity: ciphertext is
+// never moved to a different authenticated scope without client re-encryption.
 func (s *Store) ClosePullRequest(ctx context.Context, pull githubapp.PullRequest) error {
 	repositoryID, err := s.repositoryID(ctx, pull.Repository.GitHubRepoID)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin close pull request: %w", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO pull_requests(repository_id, pr_number, head_sha, base_sha, author_github_user_id, state, merged_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(repository_id, pr_number) DO UPDATE SET
@@ -690,6 +757,58 @@ func (s *Store) ClosePullRequest(ctx context.Context, pull githubapp.PullRequest
 			updated_at = excluded.updated_at`, repositoryID, pull.Number, pull.HeadSHA, pull.BaseSHA, pull.AuthorID, pull.State, pull.MergedAt, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("close pull request: %w", err)
+	}
+	now := time.Now().UTC()
+	if pull.State == "merged" {
+		rows, err := tx.QueryContext(ctx, `SELECT file_id, key_name, MAX(version) FROM secret_versions WHERE repository_id = ? AND scope = 'pull_request' AND scope_id = ? AND archived_at IS NULL GROUP BY file_id, key_name`, repositoryID, strconv.Itoa(pull.Number))
+		if err != nil {
+			return fmt.Errorf("list pending secrets for promotion: %w", err)
+		}
+		var pending []struct {
+			fileID, key string
+			version     int64
+		}
+		for rows.Next() {
+			var item struct {
+				fileID, key string
+				version     int64
+			}
+			if err := rows.Scan(&item.fileID, &item.key, &item.version); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan pending secret: %w", err)
+			}
+			pending = append(pending, item)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate pending secrets: %w", err)
+		}
+		rows.Close()
+		for _, item := range pending {
+			var baselineExists bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM secret_versions WHERE repository_id = ? AND file_id = ? AND key_name = ? AND scope = 'baseline' AND archived_at IS NULL)`, repositoryID, item.fileID, item.key).Scan(&baselineExists); err != nil {
+				return fmt.Errorf("check baseline secret: %w", err)
+			}
+			if baselineExists {
+				if _, err := tx.ExecContext(ctx, `UPDATE secret_versions SET archived_at = ? WHERE repository_id = ? AND file_id = ? AND key_name = ? AND scope = 'pull_request' AND scope_id = ? AND archived_at IS NULL`, now, repositoryID, item.fileID, item.key, strconv.Itoa(pull.Number)); err != nil {
+					return fmt.Errorf("archive conflicting pending secret: %w", err)
+				}
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE secret_versions SET promoted_at = ? WHERE repository_id = ? AND file_id = ? AND key_name = ? AND scope = 'pull_request' AND scope_id = ? AND version = ? AND archived_at IS NULL`, now, repositoryID, item.fileID, item.key, strconv.Itoa(pull.Number), item.version); err != nil {
+				return fmt.Errorf("promote pending secret: %w", err)
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE secret_versions SET archived_at = ? WHERE repository_id = ? AND scope = 'pull_request' AND scope_id = ? AND archived_at IS NULL`, now, repositoryID, strconv.Itoa(pull.Number)); err != nil {
+			return fmt.Errorf("archive pending secrets: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
+		return fmt.Errorf("advance repository revision: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit close pull request: %w", err)
 	}
 	return nil
 }
@@ -735,6 +854,268 @@ func (s *Store) PullRequestRequirements(ctx context.Context, githubRepositoryID 
 		return nil, fmt.Errorf("iterate PR requirements: %w", err)
 	}
 	return requirements, nil
+}
+
+// PullRequirementsForDevice returns public PR requirements plus only the
+// requesting active device's wrapped REK. It is the P6 read side needed for
+// local encryption; it has no plaintext or unwrapped key material.
+func (s *Store) PullRequirementsForDevice(ctx context.Context, owner, name string, number int, githubUserID int64, deviceID string) (PullRequirementsResponse, error) {
+	if number <= 0 || githubUserID <= 0 || deviceID == "" {
+		return PullRequirementsResponse{}, errors.New("invalid pull requirements request")
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil {
+		return PullRequirementsResponse{}, err
+	}
+	if !state.Initialized {
+		return PullRequirementsResponse{}, errors.New("repository encryption is not initialized")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return PullRequirementsResponse{}, err
+	}
+	var wrapped []byte
+	err = s.db.QueryRowContext(ctx, `SELECT wr.wrapped_key FROM wrapped_repo_keys wr JOIN devices d ON d.id = wr.device_id WHERE wr.repository_id = ? AND wr.epoch = ? AND wr.device_id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL`, repositoryID, state.ActiveKeyEpoch, deviceID, githubUserID).Scan(&wrapped)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PullRequirementsResponse{}, errors.New("active device does not have the repository key")
+	}
+	if err != nil {
+		return PullRequirementsResponse{}, fmt.Errorf("read wrapped repository key: %w", err)
+	}
+	var pull PullRequirementsResponse
+	pull.Repository = state
+	pull.WrappedREK = append([]byte(nil), wrapped...)
+	pull.PullRequest.Number = number
+	pull.PullRequest.Repository = githubapp.Repository{GitHubRepoID: state.GitHubRepoID, Owner: state.Owner, Name: state.Name}
+	err = s.db.QueryRowContext(ctx, `SELECT head_sha, base_sha, author_github_user_id, state, merged_at FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, number).Scan(&pull.PullRequest.HeadSHA, &pull.PullRequest.BaseSHA, &pull.PullRequest.AuthorID, &pull.PullRequest.State, &pull.PullRequest.MergedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PullRequirementsResponse{}, errors.New("pull request requirements not found")
+	}
+	if err != nil {
+		return PullRequirementsResponse{}, fmt.Errorf("read pull request: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT q.file_id, rf.target_path, q.key_name, q.requirement_state, COALESCE((SELECT MAX(version) FROM secret_versions sv WHERE sv.repository_id = q.repository_id AND sv.file_id = q.file_id AND sv.key_name = q.key_name AND sv.scope = 'pull_request' AND sv.scope_id = ? AND sv.archived_at IS NULL), 0) FROM pr_requirements q JOIN repo_files rf ON rf.id = q.file_id AND rf.repository_id = q.repository_id WHERE q.repository_id = ? AND q.pr_number = ? AND q.requirement_state != 'removed' ORDER BY q.key_name, q.file_id`, strconv.Itoa(number), repositoryID, number)
+	if err != nil {
+		return PullRequirementsResponse{}, fmt.Errorf("list pull requirements: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var requirement PullRequirement
+		if err := rows.Scan(&requirement.FileID, &requirement.FilePath, &requirement.KeyName, &requirement.State, &requirement.CurrentVersion); err != nil {
+			return PullRequirementsResponse{}, fmt.Errorf("scan pull requirement: %w", err)
+		}
+		pull.Requirements = append(pull.Requirements, requirement)
+	}
+	if err := rows.Err(); err != nil {
+		return PullRequirementsResponse{}, fmt.Errorf("iterate pull requirements: %w", err)
+	}
+	return pull, nil
+}
+
+// RepositorySnapshotForDevice returns ciphertext-only baseline state and the
+// caller's wrapped REK. Promoted PR records retain their PR scope because that
+// is the scope authenticated by their original AEAD envelope.
+func (s *Store) RepositorySnapshotForDevice(ctx context.Context, owner, name string, githubUserID int64, deviceID string) (RepositorySnapshot, error) {
+	if githubUserID <= 0 || deviceID == "" {
+		return RepositorySnapshot{}, errors.New("invalid repository snapshot request")
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil {
+		return RepositorySnapshot{}, err
+	}
+	if !state.Initialized {
+		return RepositorySnapshot{}, errors.New("repository encryption is not initialized")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return RepositorySnapshot{}, err
+	}
+	var wrapped []byte
+	err = s.db.QueryRowContext(ctx, `SELECT wr.wrapped_key FROM wrapped_repo_keys wr JOIN devices d ON d.id = wr.device_id WHERE wr.repository_id = ? AND wr.epoch = ? AND wr.device_id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL`, repositoryID, state.ActiveKeyEpoch, deviceID, githubUserID).Scan(&wrapped)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RepositorySnapshot{}, errors.New("active device does not have the repository key")
+	}
+	if err != nil {
+		return RepositorySnapshot{}, fmt.Errorf("read wrapped repository key: %w", err)
+	}
+	result := RepositorySnapshot{Repository: state, WrappedREK: append([]byte(nil), wrapped...)}
+	rows, err := s.db.QueryContext(ctx, `SELECT sv.file_id, rf.target_path, sv.key_name, sv.scope, sv.scope_id, sv.algorithm, sv.key_epoch, sv.nonce, sv.ciphertext, sv.version FROM secret_versions sv JOIN repo_files rf ON rf.id = sv.file_id AND rf.repository_id = sv.repository_id WHERE sv.repository_id = ? AND sv.archived_at IS NULL AND (sv.scope = 'baseline' OR sv.promoted_at IS NOT NULL) AND sv.version = (SELECT MAX(current.version) FROM secret_versions current WHERE current.repository_id = sv.repository_id AND current.file_id = sv.file_id AND current.key_name = sv.key_name AND current.scope = sv.scope AND current.scope_id = sv.scope_id AND current.archived_at IS NULL) ORDER BY sv.file_id, sv.key_name, sv.scope, sv.scope_id`, repositoryID)
+	if err != nil {
+		return RepositorySnapshot{}, fmt.Errorf("list encrypted repository snapshot: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var secret SecretSnapshot
+		if err := rows.Scan(&secret.FileID, &secret.FilePath, &secret.KeyName, &secret.Scope, &secret.ScopeID, &secret.Envelope.Algorithm, &secret.Envelope.KeyEpoch, &secret.Envelope.Nonce, &secret.Envelope.Ciphertext, &secret.Envelope.Version); err != nil {
+			return RepositorySnapshot{}, fmt.Errorf("scan encrypted repository snapshot: %w", err)
+		}
+		result.Secrets = append(result.Secrets, secret)
+	}
+	if err := rows.Err(); err != nil {
+		return RepositorySnapshot{}, fmt.Errorf("iterate encrypted repository snapshot: %w", err)
+	}
+	return result, nil
+}
+
+// UpdateBaselineSecret appends a locally encrypted baseline value. It is used
+// by `localenv import`; the caller must already own a wrapped active REK.
+func (s *Store) UpdateBaselineSecret(ctx context.Context, owner, name string, githubUserID int64, deviceID, fileID, keyName string, expectedVersion int64, envelope SecretEnvelope) error {
+	if expectedVersion < 0 || !validSecretIdentity(fileID, keyName) || !validSecretEnvelope(envelope) {
+		return errors.New("invalid encrypted secret update")
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil {
+		return err
+	}
+	if !state.Initialized || envelope.KeyEpoch != state.ActiveKeyEpoch {
+		return errors.New("encrypted secret uses an inactive repository key epoch")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin baseline secret update: %w", err)
+	}
+	defer tx.Rollback()
+	var allowed bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM repo_files rf JOIN devices d JOIN wrapped_repo_keys wr ON wr.device_id = d.id WHERE rf.repository_id = ? AND rf.id = ? AND d.id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL AND wr.repository_id = ? AND wr.epoch = ?)`, repositoryID, fileID, deviceID, githubUserID, repositoryID, state.ActiveKeyEpoch).Scan(&allowed)
+	if err != nil || !allowed {
+		return errors.New("active device does not have repository access")
+	}
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM secret_versions WHERE repository_id = ? AND file_id = ? AND key_name = ? AND scope = 'baseline' AND scope_id = '' AND archived_at IS NULL`, repositoryID, fileID, keyName).Scan(&current); err != nil {
+		return fmt.Errorf("read current baseline version: %w", err)
+	}
+	if current != expectedVersion || envelope.Version != current+1 {
+		return ErrSecretVersionConflict
+	}
+	id, err := newUUID()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO secret_versions(id, repository_id, file_id, key_name, scope, scope_id, version, key_epoch, algorithm, nonce, ciphertext, created_by_user_id, created_at, archived_at, promoted_at) VALUES (?, ?, ?, ?, 'baseline', '', ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`, id, repositoryID, fileID, keyName, envelope.Version, envelope.KeyEpoch, envelope.Algorithm, envelope.Nonce, envelope.Ciphertext, strconv.FormatInt(githubUserID, 10), now); err != nil {
+		return fmt.Errorf("store encrypted baseline secret: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
+		return fmt.Errorf("advance repository revision: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit encrypted baseline secret: %w", err)
+	}
+	return nil
+}
+
+// UpdatePullRequestSecret appends an immutable ciphertext version and marks
+// its public readiness requirement ready. Optimistic version checking prevents
+// one concurrent editor from silently replacing another's value.
+func (s *Store) UpdatePullRequestSecret(ctx context.Context, owner, name string, number int, githubUserID int64, deviceID, fileID, keyName string, expectedVersion int64, envelope SecretEnvelope) (PullRequestReadiness, error) {
+	if number <= 0 || expectedVersion < 0 || !validSecretIdentity(fileID, keyName) || !validSecretEnvelope(envelope) {
+		return PullRequestReadiness{}, errors.New("invalid encrypted secret update")
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil {
+		return PullRequestReadiness{}, err
+	}
+	if !state.Initialized || envelope.KeyEpoch != state.ActiveKeyEpoch {
+		return PullRequestReadiness{}, errors.New("encrypted secret uses an inactive repository key epoch")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return PullRequestReadiness{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("begin encrypted secret update: %w", err)
+	}
+	defer tx.Rollback()
+	var activeDevice string
+	err = tx.QueryRowContext(ctx, `SELECT d.id FROM devices d JOIN wrapped_repo_keys wr ON wr.device_id = d.id WHERE d.id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL AND wr.repository_id = ? AND wr.epoch = ?`, deviceID, githubUserID, repositoryID, state.ActiveKeyEpoch).Scan(&activeDevice)
+	if err != nil || activeDevice != deviceID {
+		return PullRequestReadiness{}, errors.New("active device does not have the repository key")
+	}
+	var pull githubapp.PullRequest
+	pull.Number = number
+	pull.Repository = githubapp.Repository{GitHubRepoID: state.GitHubRepoID, Owner: state.Owner, Name: state.Name}
+	err = tx.QueryRowContext(ctx, `SELECT head_sha, base_sha, author_github_user_id, state, merged_at, COALESCE(github_check_run_id, 0), COALESCE(github_comment_id, 0) FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, number).Scan(&pull.HeadSHA, &pull.BaseSHA, &pull.AuthorID, &pull.State, &pull.MergedAt, new(int64), new(int64))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PullRequestReadiness{}, errors.New("pull request requirements not found")
+	}
+	if err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("read pull request for update: %w", err)
+	}
+	if pull.State != "open" {
+		return PullRequestReadiness{}, ErrPullRequestNotOpen
+	}
+	var requirementState string
+	err = tx.QueryRowContext(ctx, `SELECT requirement_state FROM pr_requirements WHERE repository_id = ? AND pr_number = ? AND file_id = ? AND key_name = ?`, repositoryID, number, fileID, keyName).Scan(&requirementState)
+	if err != nil || requirementState == pranalysis.StateRemoved {
+		return PullRequestReadiness{}, errors.New("secret is not required by this pull request")
+	}
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM secret_versions WHERE repository_id = ? AND file_id = ? AND key_name = ? AND scope = 'pull_request' AND scope_id = ? AND archived_at IS NULL`, repositoryID, fileID, keyName, strconv.Itoa(number)).Scan(&current); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("read current encrypted secret version: %w", err)
+	}
+	if current != expectedVersion || envelope.Version != current+1 {
+		return PullRequestReadiness{}, ErrSecretVersionConflict
+	}
+	id, err := newUUID()
+	if err != nil {
+		return PullRequestReadiness{}, err
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO secret_versions(id, repository_id, file_id, key_name, scope, scope_id, version, key_epoch, algorithm, nonce, ciphertext, created_by_user_id, created_at, archived_at, promoted_at) VALUES (?, ?, ?, ?, 'pull_request', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`, id, repositoryID, fileID, keyName, strconv.Itoa(number), envelope.Version, envelope.KeyEpoch, envelope.Algorithm, envelope.Nonce, envelope.Ciphertext, strconv.FormatInt(githubUserID, 10), now); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("store encrypted secret: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE pr_requirements SET requirement_state = 'ready' WHERE repository_id = ? AND pr_number = ? AND file_id = ? AND key_name = ?`, repositoryID, number, fileID, keyName); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("mark pull requirement ready: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO repo_revisions(repository_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(repository_id) DO UPDATE SET revision = repo_revisions.revision + 1, updated_at = excluded.updated_at`, repositoryID, now); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("advance repository revision: %w", err)
+	}
+	result := PullRequestReadiness{PullRequest: pull}
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(github_check_run_id, 0), COALESCE(github_comment_id, 0) FROM pull_requests WHERE repository_id = ? AND pr_number = ?`, repositoryID, number).Scan(&result.CheckRunID, &result.CommentID); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("read readiness publication: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT file_id, key_name, requirement_state FROM pr_requirements WHERE repository_id = ? AND pr_number = ? ORDER BY key_name, file_id`, repositoryID, number)
+	if err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("list updated requirements: %w", err)
+	}
+	for rows.Next() {
+		var item pranalysis.Requirement
+		if err := rows.Scan(&item.FileID, &item.KeyName, &item.State); err != nil {
+			rows.Close()
+			return PullRequestReadiness{}, fmt.Errorf("scan updated requirement: %w", err)
+		}
+		result.Requirements = append(result.Requirements, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return PullRequestReadiness{}, fmt.Errorf("iterate updated requirements: %w", err)
+	}
+	rows.Close()
+	if err := tx.Commit(); err != nil {
+		return PullRequestReadiness{}, fmt.Errorf("commit encrypted secret update: %w", err)
+	}
+	return result, nil
+}
+
+func validSecretIdentity(fileID, keyName string) bool {
+	if fileID == "" || len(fileID) > 128 || keyName == "" || len(keyName) > 256 {
+		return false
+	}
+	for index, runeValue := range keyName {
+		if !(runeValue == '_' || runeValue >= 'A' && runeValue <= 'Z' || index > 0 && runeValue >= '0' && runeValue <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validSecretEnvelope(envelope SecretEnvelope) bool {
+	return envelope.Algorithm == "XCHACHA20-POLY1305" && envelope.KeyEpoch > 0 && envelope.Version > 0 && len(envelope.Nonce) == 24 && len(envelope.Ciphertext) >= 16 && len(envelope.Ciphertext) <= 1<<20
 }
 
 func (s *Store) repositoryID(ctx context.Context, githubRepositoryID int64) (string, error) {

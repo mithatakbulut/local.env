@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +70,13 @@ type repositoryCryptoStore interface {
 	InitializeRepositoryCrypto(context.Context, string, string, int64, string, []byte) (sqlite.RepositoryCryptoState, error)
 }
 
+type encryptedSecretStore interface {
+	PullRequirementsForDevice(context.Context, string, string, int, int64, string) (sqlite.PullRequirementsResponse, error)
+	UpdatePullRequestSecret(context.Context, string, string, int, int64, string, string, string, int64, sqlite.SecretEnvelope) (sqlite.PullRequestReadiness, error)
+	RepositorySnapshotForDevice(context.Context, string, string, int64, string) (sqlite.RepositorySnapshot, error)
+	UpdateBaselineSecret(context.Context, string, string, int64, string, string, string, int64, sqlite.SecretEnvelope) error
+}
+
 // Server holds dependencies for HTTP handlers.
 type Server struct {
 	config      config.Config
@@ -106,8 +114,209 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/devices", s.devices)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}", s.repositoryCryptoState)
 	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/init", s.initializeRepositoryCrypto)
+	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/snapshot", s.repositorySnapshot)
+	mux.HandleFunc("PUT /api/v1/repos/{owner}/{repo}/secrets/{fileID}/{keyName}", s.updateBaselineSecret)
+	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/pulls/{number}/requirements", s.pullRequirements)
+	mux.HandleFunc("PUT /api/v1/repos/{owner}/{repo}/pulls/{number}/secrets/{fileID}/{keyName}", s.updatePullRequestSecret)
 	mux.HandleFunc("POST /api/v1/github/webhook", s.githubWebhook)
 	return mux
+}
+
+func (s *Server) repositorySnapshot(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.store.(encryptedSecretStore)
+	if !ok {
+		http.Error(w, "encrypted secret persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	stateStore, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := stateStore.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if authenticated.Device.ID == "" || !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	snapshot, err := store.RepositorySnapshotForDevice(r.Context(), state.Owner, state.Name, authenticated.User.ID, authenticated.Device.ID)
+	if err != nil {
+		http.Error(w, "encrypted repository snapshot is unavailable", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (s *Server) updateBaselineSecret(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.store.(encryptedSecretStore)
+	if !ok {
+		http.Error(w, "encrypted secret persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	stateStore, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := stateStore.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if authenticated.Device.ID == "" || !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	var request struct {
+		ExpectedCurrentVersion int64                 `json:"expected_current_version"`
+		Envelope               sqlite.SecretEnvelope `json:"envelope"`
+	}
+	if !decodeRequestJSON(w, r, &request) {
+		return
+	}
+	err = store.UpdateBaselineSecret(r.Context(), state.Owner, state.Name, authenticated.User.ID, authenticated.Device.ID, r.PathValue("fileID"), r.PathValue("keyName"), request.ExpectedCurrentVersion, request.Envelope)
+	if errors.Is(err, sqlite.ErrSecretVersionConflict) {
+		http.Error(w, "secret changed remotely; refresh and retry", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, "encrypted secret update was rejected", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		State string `json:"state"`
+	}{State: "stored"})
+}
+
+func (s *Server) pullRequirements(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.store.(encryptedSecretStore)
+	if !ok {
+		http.Error(w, "encrypted secret persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	number, err := parsePositivePathInt(r.PathValue("number"))
+	if err != nil || authenticated.Device.ID == "" {
+		http.Error(w, "active device and pull request number are required", http.StatusBadRequest)
+		return
+	}
+	stateStore, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := stateStore.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	response, err := store.PullRequirementsForDevice(r.Context(), state.Owner, state.Name, number, authenticated.User.ID, authenticated.Device.ID)
+	if err != nil {
+		http.Error(w, "pull request requirements are unavailable", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) updatePullRequestSecret(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.store.(encryptedSecretStore)
+	if !ok {
+		http.Error(w, "encrypted secret persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	number, err := parsePositivePathInt(r.PathValue("number"))
+	if err != nil || authenticated.Device.ID == "" {
+		http.Error(w, "active device and pull request number are required", http.StatusBadRequest)
+		return
+	}
+	stateStore, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := stateStore.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.authorizeRepository(w, r, state, authenticated.User) {
+		return
+	}
+	var request struct {
+		ExpectedCurrentVersion int64                 `json:"expected_current_version"`
+		Envelope               sqlite.SecretEnvelope `json:"envelope"`
+	}
+	if !decodeRequestJSON(w, r, &request) {
+		return
+	}
+	readiness, err := store.UpdatePullRequestSecret(r.Context(), state.Owner, state.Name, number, authenticated.User.ID, authenticated.Device.ID, r.PathValue("fileID"), r.PathValue("keyName"), request.ExpectedCurrentVersion, request.Envelope)
+	if errors.Is(err, sqlite.ErrSecretVersionConflict) {
+		http.Error(w, "secret changed remotely; refresh and retry", http.StatusConflict)
+		return
+	}
+	if errors.Is(err, sqlite.ErrPullRequestNotOpen) {
+		http.Error(w, "pull request is not open", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, "encrypted secret update was rejected", http.StatusBadRequest)
+		return
+	}
+	credentials, configured, credentialErr := s.credentials.Load()
+	if credentialErr != nil || !configured {
+		http.Error(w, "readiness refresh is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	summary, comment, success := readinessText(readiness.Requirements, s.publicURL(fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(state.Owner), url.PathEscape(state.Name), number)))
+	publication, err := s.github.PublishReadiness(r.Context(), credentials, state.InstallationID, readiness.PullRequest, githubapp.ReadinessPublication{CheckRunID: readiness.CheckRunID, CommentID: readiness.CommentID, Success: success, Summary: summary, Comment: comment})
+	if err != nil {
+		http.Error(w, "encrypted secret was stored but readiness refresh failed", http.StatusBadGateway)
+		return
+	}
+	if publications, ok := s.store.(readinessPRStore); ok {
+		if err := publications.SaveReadinessPublication(r.Context(), state.GitHubRepoID, number, publication.CheckRunID, publication.CommentID); err != nil {
+			http.Error(w, "readiness publication could not be recorded", http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		State string `json:"state"`
+	}{State: "ready"})
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -822,13 +1031,21 @@ func decodeRequestJSON(w http.ResponseWriter, r *http.Request, target any) bool 
 	if r.Body == nil {
 		return false
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(target) != nil {
 		return false
 	}
 	var extra any
 	return decoder.Decode(&extra) == io.EOF
+}
+
+func parsePositivePathInt(raw string) (int, error) {
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, errors.New("invalid positive integer")
+	}
+	return value, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

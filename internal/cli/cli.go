@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -25,8 +26,10 @@ import (
 
 	"filippo.io/age"
 	"github.com/localenv/localenv/internal/cryptokit"
+	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/internal/repository"
 	"github.com/zalando/go-keyring"
+	"golang.org/x/term"
 )
 
 const keyringService = "localenv"
@@ -47,6 +50,12 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runLogout(args[1:], out, errOut)
 	case "repo":
 		return runRepo(args[1:], out, errOut)
+	case "resolve":
+		return runResolve(args[1:], out, errOut)
+	case "set":
+		return runSet(args[1:], out, errOut)
+	case "import":
+		return runImport(args[1:], out, errOut)
 	case "--version", "version":
 		return 0
 	case "--help", "help":
@@ -66,6 +75,317 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  status                Show signed-in user, repository, and device")
 	fmt.Fprintln(out, "  logout                Revoke and remove the local session")
 	fmt.Fprintln(out, "  repo init             Initialize client-side repository encryption")
+	fmt.Fprintln(out, "  resolve --pr NUMBER   Encrypt and resolve missing PR values")
+	fmt.Fprintln(out, "  set KEY --pr NUMBER   Encrypt and set one PR value")
+	fmt.Fprintln(out, "  import FILE           Encrypt declared values from a local dotenv file")
+}
+
+func runImport(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("import", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 1 {
+		fmt.Fprintln(errOut, "Usage: localenv import FILE [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: credential storage is unavailable")
+		return 1
+	}
+	instance, token, err := currentSession(secrets, *instanceFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: not signed in; run localenv login <instance-url>")
+		return 1
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: this machine has no registered device identity; run localenv login again")
+		return 1
+	}
+	gitIdentity, err := repository.Detect(context.Background(), ".")
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository was not detected")
+		return 1
+	}
+	owner, name := gitIdentity.Owner, gitIdentity.Name
+	if *repositoryFlag != "" {
+		owner, name, err = selectedRepository(*repositoryFlag)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: invalid repository")
+			return 1
+		}
+	}
+	contract, err := repository.LoadSnapshot(gitIdentity.Root)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: localenv.yaml or schema is invalid")
+		return 1
+	}
+	target := filepath.ToSlash(filepath.Clean(flags.Arg(0)))
+	var schema repository.SchemaFile
+	found := false
+	for _, file := range contract.Files {
+		if file.Target == target {
+			schema, found = file, true
+			break
+		}
+	}
+	if !found {
+		fmt.Fprintln(errOut, "localenv: import file is not a declared localenv.yaml target")
+		return 1
+	}
+	values, err := dotenvValues(filepath.Join(gitIdentity.Root, schema.Target))
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not parse the local dotenv file")
+		return 1
+	}
+	snapshot, err := fetchRepositorySnapshot(context.Background(), instance, token, owner, name)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository snapshot is unavailable")
+		return 1
+	}
+	rek, err := cryptokit.UnwrapREK(identity.Identity, snapshot.WrappedREK)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not unwrap this repository's encryption key")
+		return 1
+	}
+	defer clear(rek)
+	current := make(map[string]int64)
+	for _, secret := range snapshot.Secrets {
+		if secret.Scope == "baseline" && secret.FileID == pranalysis.FileID(snapshot.Repository.GitHubRepoID, schema.Schema, schema.Target) {
+			current[secret.KeyName] = secret.Envelope.Version
+		}
+	}
+	fileID := pranalysis.FileID(snapshot.Repository.GitHubRepoID, schema.Schema, schema.Target)
+	count := 0
+	for _, key := range schema.Keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		if current[key] > 0 && !confirmReplace(out) {
+			clear(value)
+			continue
+		}
+		envelope, err := cryptokit.Encrypt(rek, value, cryptokit.AAD{InstanceID: snapshot.Repository.InstanceID, GitHubRepoID: snapshot.Repository.GitHubRepoID, FilePath: schema.Target, KeyName: key, Scope: "baseline", Version: current[key] + 1, KeyEpoch: snapshot.Repository.ActiveKeyEpoch})
+		clear(value)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not encrypt a local value")
+			return 1
+		}
+		payload := struct {
+			ExpectedCurrentVersion int64              `json:"expected_current_version"`
+			Envelope               cryptokit.Envelope `json:"envelope"`
+		}{current[key], envelope}
+		endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/secrets/%s/%s", instance, url.PathEscape(owner), url.PathEscape(name), url.PathEscape(fileID), url.PathEscape(key))
+		if err := requestJSON(context.Background(), http.MethodPut, endpoint, token, payload, nil); err != nil {
+			fmt.Fprintln(errOut, "localenv: encrypted import was rejected or conflicted")
+			return 1
+		}
+		count++
+	}
+	fmt.Fprintf(out, "Encrypted and imported %d declared local value(s).\n", count)
+	return 0
+}
+
+func confirmReplace(out io.Writer) bool {
+	fmt.Fprint(out, "A remote value already exists. Replace it? [y/N] ")
+	answer, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	return err == nil && strings.EqualFold(strings.TrimSpace(answer), "y")
+}
+
+func dotenvValues(path string) (map[string][]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]byte)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, found := strings.Cut(line, "=")
+		if !found || key == "" {
+			return nil, errors.New("invalid dotenv assignment")
+		}
+		if _, exists := result[key]; exists {
+			return nil, errors.New("duplicate dotenv key")
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = value[1 : len(value)-1]
+		}
+		result[key] = []byte(value)
+	}
+	return result, nil
+}
+
+func runResolve(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	pr := flags.Int("pr", 0, "pull request number")
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *pr <= 0 {
+		fmt.Fprintln(errOut, "Usage: localenv resolve --pr NUMBER [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: credential storage is unavailable")
+		return 1
+	}
+	instance, token, err := currentSession(secrets, *instanceFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: not signed in; run localenv login <instance-url>")
+		return 1
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: this machine has no registered device identity; run localenv login again")
+		return 1
+	}
+	owner, name, err := selectedRepository(*repositoryFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository was not detected; pass --repo owner/name")
+		return 1
+	}
+	response, err := fetchPullRequirements(context.Background(), instance, token, owner, name, *pr)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: pull request requirements are unavailable")
+		return 1
+	}
+	rek, err := cryptokit.UnwrapREK(identity.Identity, response.WrappedREK)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not unwrap this repository's encryption key")
+		return 1
+	}
+	defer clear(rek)
+	missing := 0
+	for _, requirement := range response.Requirements {
+		if requirement.State != "missing" {
+			continue
+		}
+		missing++
+		if !setEncryptedPRValue(out, errOut, instance, token, owner, name, *pr, response.Repository, rek, requirement, nil) {
+			return 1
+		}
+	}
+	if missing == 0 {
+		fmt.Fprintln(out, "All PR local environment requirements are already resolved.")
+	} else {
+		fmt.Fprintf(out, "Encrypted and uploaded %d PR value(s). GitHub readiness was refreshed.\n", missing)
+	}
+	return 0
+}
+
+func runSet(args []string, out, errOut io.Writer) int {
+	flags := flag.NewFlagSet("set", flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	pr := flags.Int("pr", 0, "pull request number")
+	stdin := flags.Bool("stdin", false, "read the value from standard input")
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 1 || *pr <= 0 {
+		fmt.Fprintln(errOut, "Usage: localenv set KEY --pr NUMBER [--stdin] [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	key := flags.Arg(0)
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: credential storage is unavailable")
+		return 1
+	}
+	instance, token, err := currentSession(secrets, *instanceFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: not signed in; run localenv login <instance-url>")
+		return 1
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: this machine has no registered device identity; run localenv login again")
+		return 1
+	}
+	owner, name, err := selectedRepository(*repositoryFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository was not detected; pass --repo owner/name")
+		return 1
+	}
+	response, err := fetchPullRequirements(context.Background(), instance, token, owner, name, *pr)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: pull request requirements are unavailable")
+		return 1
+	}
+	rek, err := cryptokit.UnwrapREK(identity.Identity, response.WrappedREK)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not unwrap this repository's encryption key")
+		return 1
+	}
+	defer clear(rek)
+	for _, requirement := range response.Requirements {
+		if requirement.KeyName == key && requirement.State != "removed" {
+			var value []byte
+			if *stdin {
+				value, err = io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+				value = bytes.TrimSuffix(value, []byte("\n"))
+			} else {
+				value, err = hiddenValue(out)
+			}
+			if err != nil {
+				fmt.Fprintln(errOut, "localenv: could not read a secret value")
+				return 1
+			}
+			defer clear(value)
+			if !setEncryptedPRValue(out, errOut, instance, token, owner, name, *pr, response.Repository, rek, requirement, value) {
+				return 1
+			}
+			fmt.Fprintln(out, "Encrypted locally, uploaded, and refreshed GitHub readiness.")
+			return 0
+		}
+	}
+	fmt.Fprintf(errOut, "localenv: %s is not required by PR #%d\n", key, *pr)
+	return 1
+}
+
+func hiddenValue(out io.Writer) ([]byte, error) {
+	fmt.Fprint(out, "Value: ")
+	value, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(out)
+	return value, err
+}
+
+func setEncryptedPRValue(out, errOut io.Writer, instance, token, owner, name string, pr int, state apiRepositoryCryptoState, rek []byte, requirement apiPullRequirement, supplied []byte) bool {
+	value := supplied
+	if value == nil {
+		var err error
+		value, err = hiddenValue(out)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not read a secret value")
+			return false
+		}
+		defer clear(value)
+	}
+	envelope, err := cryptokit.Encrypt(rek, value, cryptokit.AAD{InstanceID: state.InstanceID, GitHubRepoID: state.GitHubRepoID, FilePath: requirement.FilePath, KeyName: requirement.KeyName, Scope: "pull_request", ScopeID: fmt.Sprintf("%d", pr), Version: requirement.CurrentVersion + 1, KeyEpoch: state.ActiveKeyEpoch})
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not encrypt the secret")
+		return false
+	}
+	payload := struct {
+		ExpectedCurrentVersion int64              `json:"expected_current_version"`
+		Envelope               cryptokit.Envelope `json:"envelope"`
+	}{requirement.CurrentVersion, envelope}
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/secrets/%s/%s", instance, url.PathEscape(owner), url.PathEscape(name), pr, url.PathEscape(requirement.FileID), url.PathEscape(requirement.KeyName))
+	if err := requestJSON(context.Background(), http.MethodPut, endpoint, token, payload, nil); err != nil {
+		fmt.Fprintln(errOut, "localenv: encrypted secret update was rejected or conflicted")
+		return false
+	}
+	return true
 }
 
 func runLogin(args []string, out, errOut io.Writer) int {
@@ -437,6 +757,7 @@ func (s *fileStore) Delete(key string) error {
 
 type deviceIdentity struct {
 	ID, Name, Recipient, Fingerprint string
+	Identity                         *age.X25519Identity
 }
 
 func loadOrCreateIdentity(store secretStore, instance string) (deviceIdentity, error) {
@@ -470,7 +791,7 @@ func loadOrCreateIdentity(store secretStore, instance string) (deviceIdentity, e
 func identityFrom(id, name string, identity *age.X25519Identity) deviceIdentity {
 	recipient := identity.Recipient().String()
 	sum := sha256.Sum256([]byte(recipient))
-	return deviceIdentity{ID: id, Name: name, Recipient: recipient, Fingerprint: "sha256:" + hex.EncodeToString(sum[:8])}
+	return deviceIdentity{ID: id, Name: name, Recipient: recipient, Fingerprint: "sha256:" + hex.EncodeToString(sum[:8]), Identity: identity}
 }
 
 func loadIdentity(store secretStore, instance string) (deviceIdentity, error) {
@@ -531,6 +852,33 @@ type apiRepositoryCryptoState struct {
 	Initialized    bool   `json:"initialized"`
 }
 
+type apiPullRequirement struct {
+	FileID         string `json:"file_id"`
+	FilePath       string `json:"file_path"`
+	KeyName        string `json:"key_name"`
+	State          string `json:"state"`
+	CurrentVersion int64  `json:"current_version"`
+}
+
+type apiPullRequirements struct {
+	Repository   apiRepositoryCryptoState `json:"repository"`
+	WrappedREK   []byte                   `json:"wrapped_rek"`
+	Requirements []apiPullRequirement     `json:"requirements"`
+}
+
+type apiSecretSnapshot struct {
+	FileID   string             `json:"file_id"`
+	KeyName  string             `json:"key_name"`
+	Scope    string             `json:"scope"`
+	Envelope cryptokit.Envelope `json:"envelope"`
+}
+
+type apiRepositorySnapshot struct {
+	Repository apiRepositoryCryptoState `json:"repository"`
+	WrappedREK []byte                   `json:"wrapped_rek"`
+	Secrets    []apiSecretSnapshot      `json:"secrets"`
+}
+
 func exchange(ctx context.Context, instance, code string) (apiSession, error) {
 	var out apiSession
 	return out, requestJSON(ctx, http.MethodPost, instance+"/api/v1/auth/exchange", "", map[string]string{"code": code}, &out)
@@ -546,6 +894,16 @@ func fetchMe(ctx context.Context, instance, token string) (apiMe, error) {
 }
 func revoke(ctx context.Context, instance, token string) error {
 	return requestJSON(ctx, http.MethodPost, instance+"/api/v1/auth/logout", token, nil, nil)
+}
+func fetchPullRequirements(ctx context.Context, instance, token, owner, name string, number int) (apiPullRequirements, error) {
+	var result apiPullRequirements
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/requirements", instance, url.PathEscape(owner), url.PathEscape(name), number)
+	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
+}
+func fetchRepositorySnapshot(ctx context.Context, instance, token, owner, name string) (apiRepositorySnapshot, error) {
+	var result apiRepositorySnapshot
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/snapshot", instance, url.PathEscape(owner), url.PathEscape(name))
+	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
 }
 func requestJSON(ctx context.Context, method, endpoint, token string, payload, target any) error {
 	var body io.Reader

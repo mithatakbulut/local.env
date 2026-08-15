@@ -25,6 +25,7 @@ import (
 	"github.com/localenv/localenv/internal/config"
 	"github.com/localenv/localenv/internal/cryptokit"
 	"github.com/localenv/localenv/internal/githubapp"
+	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/internal/store/sqlite"
 )
 
@@ -139,6 +140,10 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
 		case "/repos/acme/api/collaborators/developer/permission":
 			_, _ = w.Write([]byte(`{"permission":"` + permission + `"}`))
+		case "/repos/acme/api/check-runs":
+			_, _ = w.Write([]byte(`{"id":101}`))
+		case "/repos/acme/api/issues/100/comments":
+			_, _ = w.Write([]byte(`{"id":202}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -203,6 +208,46 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 	app.Handler().ServeHTTP(postRecorder, post)
 	if postRecorder.Code != http.StatusCreated || strings.Contains(postRecorder.Body.String(), string(rek)) {
 		t.Fatalf("bootstrap init = %d, %s", postRecorder.Code, postRecorder.Body.String())
+	}
+	cryptoState, err := store.RepositoryCryptoState(ctx, "acme", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileID := pranalysis.FileID(17, ".env.example", ".env.local")
+	pull := githubapp.PullRequest{Number: 100, BaseSHA: "base", HeadSHA: "head", AuthorID: user.ID, State: "open", Repository: githubapp.Repository{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main"}}
+	if _, err := store.SavePullRequestRequirements(ctx, pull, []pranalysis.Requirement{{FileID: fileID, KeyName: "STRIPE_SECRET_KEY", State: pranalysis.StateMissing}}); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := cryptokit.Encrypt(rek, []byte("non-secret-pr-value"), cryptokit.AAD{InstanceID: cryptoState.InstanceID, GitHubRepoID: 17, FilePath: ".env.local", KeyName: "STRIPE_SECRET_KEY", Scope: "pull_request", ScopeID: "100", Version: 1, KeyEpoch: cryptoState.ActiveKeyEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatePayload, err := json.Marshal(struct {
+		ExpectedCurrentVersion int64              `json:"expected_current_version"`
+		Envelope               cryptokit.Envelope `json:"envelope"`
+	}{ExpectedCurrentVersion: 0, Envelope: envelope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := httptest.NewRequest(http.MethodPut, "/api/v1/repos/acme/api/pulls/100/secrets/"+url.PathEscape(fileID)+"/STRIPE_SECRET_KEY", bytes.NewReader(updatePayload))
+	update.Header.Set("Content-Type", "application/json")
+	update.Header.Set("Authorization", "Bearer "+token)
+	updated := httptest.NewRecorder()
+	app.Handler().ServeHTTP(updated, update)
+	if updated.Code != http.StatusOK || strings.Contains(updated.Body.String(), "non-secret-pr-value") {
+		t.Fatalf("encrypted PR update = %d, %s", updated.Code, updated.Body.String())
+	}
+	requirements, err := store.PullRequestRequirements(ctx, 17, 100)
+	if err != nil || len(requirements) != 1 || requirements[0].State != pranalysis.StateReady {
+		t.Fatalf("updated requirements = %#v, %v", requirements, err)
+	}
+	pull.State = "merged"
+	if err := store.ClosePullRequest(ctx, pull); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", user.ID, "device-1")
+	if err != nil || len(snapshot.Secrets) != 1 || snapshot.Secrets[0].KeyName != "STRIPE_SECRET_KEY" || snapshot.Secrets[0].Scope != "pull_request" || strings.Contains(string(snapshot.Secrets[0].Envelope.Ciphertext), "non-secret-pr-value") {
+		t.Fatalf("promoted PR snapshot = %#v, %v", snapshot, err)
 	}
 	permission = "read"
 	denied := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api", nil)
