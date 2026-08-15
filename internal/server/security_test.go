@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -50,6 +51,92 @@ func TestSecurityMiddlewareSetsHeadersRedactsRequestDataAndLimitsAuthentication(
 	}
 }
 
+func TestBrandingCSPAllowsOnlyConfiguredHTTPSImageOrigins(t *testing.T) {
+	app := New(config.Config{
+		PublicURL:  mustURL(t, "https://env.example.test"),
+		LogoURL:    mustURL(t, "https://brand.example.test/logo.svg"),
+		FaviconURL: mustURL(t, "https://brand.example.test/favicon.ico"),
+	}, testStore{})
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	policy := response.Header().Get("Content-Security-Policy")
+	if !strings.Contains(policy, "script-src 'self'") || !strings.Contains(policy, "style-src 'self'") || !strings.Contains(policy, "font-src 'self'") || !strings.Contains(policy, "img-src 'self' https://brand.example.test") || strings.Contains(policy, "https://unapproved.example.test") {
+		t.Fatalf("branding CSP = %q", policy)
+	}
+}
+
+func TestDashboardShellRendersOnlyApprovedBrandingMetadata(t *testing.T) {
+	app := New(config.Config{
+		PublicURL:   mustURL(t, "https://env.example.test"),
+		DisplayName: "Acme Local Env",
+		LogoURL:     mustURL(t, "https://brand.example.test/logo.svg"),
+		FaviconURL:  mustURL(t, "https://brand.example.test/favicon.ico"),
+	}, testStore{})
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/setup", nil))
+	body := html.UnescapeString(response.Body.String())
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(body, `id="dashboard-shell"`) || !strings.Contains(body, `Acme Local Env`) || !strings.Contains(body, `https://brand.example.test/logo.svg`) || !strings.Contains(body, `https://brand.example.test/favicon.ico`) || !strings.Contains(body, `/assets/index-`) {
+		t.Fatalf("setup shell = %d %q", response.Code, body)
+	}
+	if strings.Contains(body, "<script>") || strings.Contains(body, "style=") || strings.Contains(body, "http://") {
+		t.Fatalf("setup shell contained unsafe executable or branding markup: %q", body)
+	}
+}
+
+func TestDashboardShellWithoutBrandingUsesOnlySelfHostedAssets(t *testing.T) {
+	app := New(config.Config{PublicURL: mustURL(t, "https://env.example.test")}, testStore{})
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/setup", nil))
+	body := html.UnescapeString(response.Body.String())
+	policy := response.Header().Get("Content-Security-Policy")
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(body, `"display_name":"local.env"`) || strings.Contains(body, `"logo_url":"https://`) || strings.Contains(body, `rel="icon"`) || !strings.Contains(body, `/assets/index-`) {
+		t.Fatalf("unbranded setup shell = %d %q", response.Code, body)
+	}
+	if strings.Contains(policy, "img-src 'self' https://") || !strings.Contains(policy, "img-src 'self'") || !strings.Contains(policy, "script-src 'self'") || !strings.Contains(policy, "style-src 'self'") || !strings.Contains(policy, "font-src 'self'") {
+		t.Fatalf("unbranded dashboard CSP = %q", policy)
+	}
+}
+
+func TestBrandingURLStringRejectsUnsafeDirectConfig(t *testing.T) {
+	unsafe := mustURL(t, "http://brand.example.test/logo.svg")
+	if got := brandingURLString(unsafe); got != "" {
+		t.Fatalf("unsafe branding URL = %q", got)
+	}
+}
+
+func TestDashboardAssetsAreEmbeddedHashedAndImmutable(t *testing.T) {
+	assets, err := dashboardAssetNames()
+	if err != nil || len(assets) == 0 {
+		t.Fatalf("embedded dashboard assets = %#v, %v", assets, err)
+	}
+	app := New(config.Config{PublicURL: mustURL(t, "https://env.example.test")}, testStore{})
+	asset := httptest.NewRecorder()
+	app.Handler().ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/assets/"+assets[0], nil))
+	if asset.Code != http.StatusOK || asset.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" || asset.Header().Get("Content-Type") == "" || asset.Body.Len() == 0 {
+		t.Fatalf("asset response = %d, headers=%#v, bytes=%d", asset.Code, asset.Header(), asset.Body.Len())
+	}
+	for _, requestPath := range []string{"/assets/", "/assets/not-hashed.js", "/assets/../dashboard.go"} {
+		blocked := httptest.NewRecorder()
+		app.Handler().ServeHTTP(blocked, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if blocked.Code != http.StatusNotFound {
+			t.Fatalf("unsafe asset %q = %d, want 404", requestPath, blocked.Code)
+		}
+	}
+}
+
+func TestUnsafeAssetRequestPath(t *testing.T) {
+	for _, requestPath := range []string{"/assets/../dashboard.go", "/assets/./index.js", "/assets/nested/../../dashboard.go"} {
+		if !unsafeAssetRequestPath(requestPath) {
+			t.Fatalf("unsafe asset path %q was accepted", requestPath)
+		}
+	}
+	for _, requestPath := range []string{"/repos/acme/api", "/assets/index-CScqf1x0.js", "/assets/"} {
+		if unsafeAssetRequestPath(requestPath) {
+			t.Fatalf("safe path %q was rejected", requestPath)
+		}
+	}
+}
+
 func TestGitHubPublicationFailureLogsOnlySafeStatusMetadata(t *testing.T) {
 	var logs bytes.Buffer
 	app := NewWithGitHubClientAndLogger(config.Config{}, testStore{}, githubapp.DefaultClient(), slog.New(slog.NewTextHandler(&logs, nil)))
@@ -76,27 +163,66 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 	if _, err := store.SavePullRequestRequirements(ctx, pull, []pranalysis.Requirement{{FileID: pranalysis.FileID(42, ".env.example", ".env.local"), KeyName: "P11_DASHBOARD_KEY", State: pranalysis.StateMissing}}); err != nil {
 		t.Fatal(err)
 	}
-	app := New(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), DisplayName: "Acme Local Env", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store)
-	unauthenticated := httptest.NewRecorder()
-	app.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/repos", nil))
-	if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login" {
-		t.Fatalf("unauthenticated dashboard = %d %q", unauthenticated.Code, unauthenticated.Header().Get("Location"))
+	repository, err := store.DashboardRepository(ctx, "acme", "api")
+	if err != nil || repository.OpenPullRequestCnt != 1 || repository.MissingRequirementCnt != 1 || len(repository.OpenPullRequests) != 1 || repository.OpenPullRequests[0].MissingRequirementCnt != 1 {
+		t.Fatalf("dashboard readiness summary = %#v, %v", repository, err)
+	}
+	const browserSentinel = "D5-NON-SECRET-BROWSER-SENTINEL"
+	var logs bytes.Buffer
+	app := NewWithGitHubClientAndLogger(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), DisplayName: "Acme Local Env", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.DefaultClient(), slog.New(slog.NewTextHandler(&logs, nil)))
+	for _, requestPath := range []string{"/repos", "/repos/acme/api", "/repos/acme/api/pulls/12", "/devices", "/audit", "/settings"} {
+		unauthenticated := httptest.NewRecorder()
+		app.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login" {
+			t.Fatalf("unauthenticated dashboard %q = %d %q", requestPath, unauthenticated.Code, unauthenticated.Header().Get("Location"))
+		}
 	}
 	cookieResponse := httptest.NewRecorder()
 	if !app.writeCookie(cookieResponse, dashboardCookie, dashboardSession{User: githubapp.User{ID: 11, Login: "admin"}, OrganizationID: 7, ExpiresAt: time.Now().UTC().Add(time.Hour)}, time.Hour) {
 		t.Fatal("write dashboard cookie")
 	}
 	cookie := cookieNamed(t, cookieResponse.Result().Cookies(), dashboardCookie)
-	pageRequest := httptest.NewRequest(http.MethodGet, "/repos/acme/api/pulls/12", nil)
-	pageRequest.AddCookie(cookie)
-	page := httptest.NewRecorder()
-	app.Handler().ServeHTTP(page, pageRequest)
-	body, err := io.ReadAll(page.Result().Body)
-	if err != nil {
+	for _, pageCase := range []struct {
+		path string
+		kind string
+	}{
+		{path: "/repos", kind: `"kind":"repositories"`},
+		{path: "/repos/acme/api", kind: `"kind":"repository"`},
+		{path: "/repos/acme/api/pulls/12", kind: `"kind":"pull_request"`},
+		{path: "/devices", kind: `"kind":"devices"`},
+		{path: "/audit", kind: `"kind":"audit"`},
+		{path: "/settings", kind: `"kind":"settings"`},
+	} {
+		pageRequest := httptest.NewRequest(http.MethodGet, pageCase.path, nil)
+		pageRequest.AddCookie(cookie)
+		page := httptest.NewRecorder()
+		app.Handler().ServeHTTP(page, pageRequest)
+		body, err := io.ReadAll(page.Result().Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pageBody := html.UnescapeString(string(body))
+		if page.Code != http.StatusOK || !strings.Contains(pageBody, pageCase.kind) || strings.Contains(pageBody, browserSentinel) || strings.Contains(pageBody, "ciphertext") || strings.Contains(pageBody, "wrapped_rek") || strings.Contains(pageBody, "secret_value") {
+			t.Fatalf("dashboard page %q = %d %q", pageCase.path, page.Code, body)
+		}
+	}
+
+	// The sentinel stands in for sensitive browser input. It is intentionally
+	// non-secret and must never be reflected by API responses or request logs.
+	if err := store.CreateSession(ctx, githubapp.User{ID: 11, Login: "admin"}, browserSentinel, time.Now().UTC().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if page.Code != http.StatusOK || !strings.Contains(string(body), "P11_DASHBOARD_KEY") || strings.Contains(string(body), "ciphertext") {
-		t.Fatalf("dashboard PR page = %d %q", page.Code, body)
+	for _, requestPath := range []string{"/api/v1/me", "/api/v1/devices"} {
+		request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		request.Header.Set("Authorization", "Bearer "+browserSentinel)
+		response := httptest.NewRecorder()
+		app.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK || strings.Contains(response.Body.String(), browserSentinel) {
+			t.Fatalf("dashboard API %q = %d %q", requestPath, response.Code, response.Body.String())
+		}
+	}
+	if strings.Contains(logs.String(), browserSentinel) {
+		t.Fatalf("dashboard request logs reflected browser sentinel: %q", logs.String())
 	}
 	wrongOrigin := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{}`))
 	wrongOrigin.Header.Set("Origin", "https://other.example.test")

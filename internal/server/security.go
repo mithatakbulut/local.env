@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,11 +70,16 @@ func (w *statusRecorder) Write(body []byte) (int, error) {
 
 func (s *Server) withSecurity(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setSecurityHeaders(w, s.config.PublicURL != nil && s.config.PublicURL.Scheme == "https")
+		setSecurityHeaders(w, s.config.PublicURL != nil && s.config.PublicURL.Scheme == "https", brandingImageOrigins(s.config.LogoURL, s.config.FaviconURL))
 		requestID := requestID(r)
 		w.Header().Set("X-Request-ID", requestID)
 		started := time.Now()
 		recorder := &statusRecorder{ResponseWriter: w}
+		if unsafeAssetRequestPath(r.URL.Path) {
+			http.NotFound(recorder, r)
+			s.logRequest(requestID, r, recorder.status, started)
+			return
+		}
 
 		if unsafeMethod(r.Method) && r.URL.Path != "/api/v1/github/webhook" && s.rejectCrossOrigin(r) {
 			http.Error(recorder, "cross-origin request rejected", http.StatusForbidden)
@@ -90,8 +97,24 @@ func (s *Server) withSecurity(next http.Handler) http.Handler {
 	})
 }
 
-func setSecurityHeaders(w http.ResponseWriter, https bool) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://github.com; object-src 'none'; style-src 'self'")
+func unsafeAssetRequestPath(requestPath string) bool {
+	if !strings.HasPrefix(requestPath, "/assets/") {
+		return false
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(requestPath, "/assets/"), "/") {
+		if segment == "." || segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func setSecurityHeaders(w http.ResponseWriter, https bool, imageOrigins []string) {
+	imageSources := "'self'"
+	if len(imageOrigins) > 0 {
+		imageSources += " " + strings.Join(imageOrigins, " ")
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://github.com; object-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src "+imageSources)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	// no-referrer makes Chromium emit Origin: null for ordinary HTML form POSTs,
@@ -104,6 +127,30 @@ func setSecurityHeaders(w http.ResponseWriter, https bool) {
 	if https {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 	}
+}
+
+func brandingImageOrigins(urls ...*url.URL) []string {
+	origins := make([]string, 0, len(urls))
+	seen := make(map[string]struct{}, len(urls))
+	for _, value := range urls {
+		if value == nil || value.Scheme != "https" || value.Host == "" {
+			continue
+		}
+		origin := value.Scheme + "://" + value.Host
+		if _, exists := seen[origin]; !exists {
+			seen[origin] = struct{}{}
+			origins = append(origins, origin)
+		}
+	}
+	sort.Strings(origins)
+	return origins
+}
+
+func brandingURLString(value *url.URL) string {
+	if value == nil || value.Scheme != "https" || value.Host == "" || value.User != nil || value.RawQuery != "" || value.Fragment != "" {
+		return ""
+	}
+	return value.String()
 }
 
 func unsafeMethod(method string) bool {

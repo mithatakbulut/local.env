@@ -15,23 +15,25 @@ import (
 // DashboardRepository is deliberately metadata-only. It has no ciphertext,
 // wrapped key, secret value, or private device identity field.
 type DashboardRepository struct {
-	Owner              string
-	Name               string
-	DefaultBranch      string
-	ActiveKeyEpoch     int64
-	Revision           int64
-	ManagedKeyCount    int
-	OpenPullRequestCnt int
-	Files              []RepositoryFile
-	OpenPullRequests   []DashboardPullRequest
+	Owner                 string
+	Name                  string
+	DefaultBranch         string
+	ActiveKeyEpoch        int64
+	Revision              int64
+	ManagedKeyCount       int
+	OpenPullRequestCnt    int
+	MissingRequirementCnt int
+	Files                 []RepositoryFile
+	OpenPullRequests      []DashboardPullRequest
 }
 
 // DashboardPullRequest is the public readiness state shown by the web UI.
 type DashboardPullRequest struct {
-	Number       int
-	State        string
-	UpdatedAt    time.Time
-	Requirements []pranalysis.Requirement
+	Number                int
+	State                 string
+	UpdatedAt             time.Time
+	MissingRequirementCnt int
+	Requirements          []pranalysis.Requirement
 }
 
 // AuditEvent contains allowlisted metadata about an action. Audit metadata is
@@ -68,7 +70,10 @@ func (s *Store) DashboardRepositories(ctx context.Context) ([]DashboardRepositor
 		       COALESCE(rv.revision, 0),
 		       (SELECT COUNT(DISTINCT sv.file_id || char(0) || sv.key_name)
 		          FROM secret_versions sv WHERE sv.repository_id = r.id AND sv.archived_at IS NULL),
-		       (SELECT COUNT(*) FROM pull_requests p WHERE p.repository_id = r.id AND p.state = 'open')
+		       (SELECT COUNT(*) FROM pull_requests p WHERE p.repository_id = r.id AND p.state = 'open'),
+		       (SELECT COUNT(*) FROM pr_requirements q JOIN pull_requests p
+		          ON p.repository_id = q.repository_id AND p.pr_number = q.pr_number
+		          WHERE q.repository_id = r.id AND p.state = 'open' AND q.requirement_state = 'missing')
 		FROM repositories r
 		LEFT JOIN repo_revisions rv ON rv.repository_id = r.id
 		ORDER BY r.owner, r.name`)
@@ -79,7 +84,7 @@ func (s *Store) DashboardRepositories(ctx context.Context) ([]DashboardRepositor
 	var result []DashboardRepository
 	for rows.Next() {
 		var repository DashboardRepository
-		if err := rows.Scan(&repository.Owner, &repository.Name, &repository.DefaultBranch, &repository.ActiveKeyEpoch, &repository.Revision, &repository.ManagedKeyCount, &repository.OpenPullRequestCnt); err != nil {
+		if err := rows.Scan(&repository.Owner, &repository.Name, &repository.DefaultBranch, &repository.ActiveKeyEpoch, &repository.Revision, &repository.ManagedKeyCount, &repository.OpenPullRequestCnt, &repository.MissingRequirementCnt); err != nil {
 			return nil, fmt.Errorf("scan dashboard repository: %w", err)
 		}
 		result = append(result, repository)
@@ -99,9 +104,12 @@ func (s *Store) DashboardRepository(ctx context.Context, owner, name string) (Da
 		       COALESCE(rv.revision, 0),
 		       (SELECT COUNT(DISTINCT sv.file_id || char(0) || sv.key_name)
 		          FROM secret_versions sv WHERE sv.repository_id = r.id AND sv.archived_at IS NULL),
-		       (SELECT COUNT(*) FROM pull_requests p WHERE p.repository_id = r.id AND p.state = 'open')
+		       (SELECT COUNT(*) FROM pull_requests p WHERE p.repository_id = r.id AND p.state = 'open'),
+		       (SELECT COUNT(*) FROM pr_requirements q JOIN pull_requests p
+		          ON p.repository_id = q.repository_id AND p.pr_number = q.pr_number
+		          WHERE q.repository_id = r.id AND p.state = 'open' AND q.requirement_state = 'missing')
 		FROM repositories r LEFT JOIN repo_revisions rv ON rv.repository_id = r.id
-		WHERE r.owner = ? AND r.name = ?`, owner, name).Scan(&id, &repository.Owner, &repository.Name, &repository.DefaultBranch, &repository.ActiveKeyEpoch, &repository.Revision, &repository.ManagedKeyCount, &repository.OpenPullRequestCnt)
+		WHERE r.owner = ? AND r.name = ?`, owner, name).Scan(&id, &repository.Owner, &repository.Name, &repository.DefaultBranch, &repository.ActiveKeyEpoch, &repository.Revision, &repository.ManagedKeyCount, &repository.OpenPullRequestCnt, &repository.MissingRequirementCnt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DashboardRepository{}, ErrRepositoryNotManaged
 	}
@@ -123,14 +131,16 @@ func (s *Store) DashboardRepository(ctx context.Context, owner, name string) (Da
 	if err := rows.Err(); err != nil {
 		return DashboardRepository{}, err
 	}
-	pulls, err := s.db.QueryContext(ctx, `SELECT pr_number, state, updated_at FROM pull_requests WHERE repository_id = ? AND state = 'open' ORDER BY pr_number DESC`, id)
+	pulls, err := s.db.QueryContext(ctx, `SELECT p.pr_number, p.state, p.updated_at,
+		(SELECT COUNT(*) FROM pr_requirements q WHERE q.repository_id = p.repository_id AND q.pr_number = p.pr_number AND q.requirement_state = 'missing')
+		FROM pull_requests p WHERE p.repository_id = ? AND p.state = 'open' ORDER BY p.pr_number DESC`, id)
 	if err != nil {
 		return DashboardRepository{}, fmt.Errorf("list dashboard pull requests: %w", err)
 	}
 	defer pulls.Close()
 	for pulls.Next() {
 		var pull DashboardPullRequest
-		if err := pulls.Scan(&pull.Number, &pull.State, &pull.UpdatedAt); err != nil {
+		if err := pulls.Scan(&pull.Number, &pull.State, &pull.UpdatedAt, &pull.MissingRequirementCnt); err != nil {
 			return DashboardRepository{}, fmt.Errorf("scan dashboard pull request: %w", err)
 		}
 		repository.OpenPullRequests = append(repository.OpenPullRequests, pull)
@@ -167,18 +177,38 @@ func (s *Store) DashboardPullRequest(ctx context.Context, owner, name string, nu
 	return result, rows.Err()
 }
 
-// DashboardDevices returns public, active device metadata only.
-func (s *Store) DashboardDevices(ctx context.Context) ([]RepositoryDevice, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.github_user_id, u.login, d.name, d.public_recipient, d.fingerprint, d.created_at, d.last_seen_at, EXISTS(SELECT 1 FROM wrapped_repo_keys wr WHERE wr.device_id = d.id) FROM devices d JOIN github_users u ON u.github_user_id = d.github_user_id WHERE d.revoked_at IS NULL ORDER BY d.created_at DESC, d.id`)
+// DashboardDevice is the allowlisted public device metadata needed by the
+// dashboard. It intentionally omits the age recipient and all session/key
+// material. Revocation is included so the operational view can distinguish a
+// removed device from one that is merely missing repository-key access.
+type DashboardDevice struct {
+	ID          string
+	GitHubLogin string
+	Name        string
+	Fingerprint string
+	CreatedAt   time.Time
+	LastSeenAt  time.Time
+	RevokedAt   *time.Time
+	HasKey      bool
+}
+
+// DashboardDevices returns public device metadata, including revocations.
+func (s *Store) DashboardDevices(ctx context.Context) ([]DashboardDevice, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id, u.login, d.name, d.fingerprint, d.created_at, d.last_seen_at, d.revoked_at, EXISTS(SELECT 1 FROM wrapped_repo_keys wr WHERE wr.device_id = d.id) FROM devices d JOIN github_users u ON u.github_user_id = d.github_user_id ORDER BY d.revoked_at IS NOT NULL, d.created_at DESC, d.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list dashboard devices: %w", err)
 	}
 	defer rows.Close()
-	var result []RepositoryDevice
+	var result []DashboardDevice
 	for rows.Next() {
-		var device RepositoryDevice
-		if err := rows.Scan(&device.ID, &device.GitHubUserID, &device.GitHubLogin, &device.Name, &device.PublicRecipient, &device.Fingerprint, &device.CreatedAt, &device.LastSeenAt, &device.HasKey); err != nil {
+		var device DashboardDevice
+		var revokedAt sql.NullTime
+		if err := rows.Scan(&device.ID, &device.GitHubLogin, &device.Name, &device.Fingerprint, &device.CreatedAt, &device.LastSeenAt, &revokedAt, &device.HasKey); err != nil {
 			return nil, fmt.Errorf("scan dashboard device: %w", err)
+		}
+		if revokedAt.Valid {
+			value := revokedAt.Time
+			device.RevokedAt = &value
 		}
 		result = append(result, device)
 	}

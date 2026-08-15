@@ -1,10 +1,19 @@
 # syntax=docker/dockerfile:1
+FROM node:26-alpine AS frontend-build
+
+WORKDIR /src/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+COPY --from=frontend-build /src/internal/server/ui/dist ./internal/server/ui/dist
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/localenv-server ./cmd/localenv-server && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/localenv ./cmd/localenv
 

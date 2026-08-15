@@ -47,13 +47,13 @@ func LoadFromEnv() (Config, error) {
 	}
 
 	var err error
-	if cfg.PublicURL, err = parseHTTPURL("LOCALENV_PUBLIC_URL", os.Getenv("LOCALENV_PUBLIC_URL"), true); err != nil {
+	if cfg.PublicURL, err = parseHTTPURL("LOCALENV_PUBLIC_URL", os.Getenv("LOCALENV_PUBLIC_URL"), true, false); err != nil {
 		return Config{}, err
 	}
-	if cfg.LogoURL, err = parseHTTPURL("LOCALENV_LOGO_URL", os.Getenv("LOCALENV_LOGO_URL"), false); err != nil {
+	if cfg.LogoURL, err = parseHTTPURL("LOCALENV_LOGO_URL", os.Getenv("LOCALENV_LOGO_URL"), false, true); err != nil {
 		return Config{}, err
 	}
-	if cfg.FaviconURL, err = parseHTTPURL("LOCALENV_FAVICON_URL", os.Getenv("LOCALENV_FAVICON_URL"), false); err != nil {
+	if cfg.FaviconURL, err = parseHTTPURL("LOCALENV_FAVICON_URL", os.Getenv("LOCALENV_FAVICON_URL"), false, true); err != nil {
 		return Config{}, err
 	}
 	cfg.GitHubOAuthClientID = strings.TrimSpace(os.Getenv("LOCALENV_GITHUB_OAUTH_CLIENT_ID"))
@@ -84,7 +84,7 @@ func valueOr(name, fallback string) string {
 	return fallback
 }
 
-func parseHTTPURL(name, raw string, required bool) (*url.URL, error) {
+func parseHTTPURL(name, raw string, required, httpsOnly bool) (*url.URL, error) {
 	if strings.TrimSpace(raw) == "" {
 		if required {
 			return nil, fmt.Errorf("%s is required", name)
@@ -97,6 +97,9 @@ func parseHTTPURL(name, raw string, required bool) (*url.URL, error) {
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return nil, fmt.Errorf("%s must use http or https", name)
+	}
+	if httpsOnly && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("%s must use https", name)
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, fmt.Errorf("%s must not contain credentials, a query, or a fragment", name)

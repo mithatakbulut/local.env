@@ -74,6 +74,43 @@ func TestCLIAuthStoresOnlyHashedCodesAndSessionTokens(t *testing.T) {
 	}
 }
 
+func TestDashboardDevicesShowsRevokedDevicesWithoutKeyMaterial(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	user := githubapp.User{ID: 77, Login: "dashboard-developer"}
+	if err := store.CreateAuthExchange(ctx, user, "non-secret-dashboard-exchange", time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeAuthExchange(ctx, "non-secret-dashboard-exchange"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, user, "non-secret-dashboard-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.RegisterDevice(ctx, "non-secret-dashboard-session", "dashboard-device", "dashboard laptop", identity.Recipient().String(), "sha256:dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeDevice(ctx, user.ID, device.ID, device.ID); err != nil {
+		t.Fatal(err)
+	}
+	devices, err := store.DashboardDevices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].ID != device.ID || devices[0].RevokedAt == nil || devices[0].HasKey {
+		t.Fatalf("dashboard devices = %#v", devices)
+	}
+}
+
 func TestOpenAppliesMigrationsWALAndPermissions(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(context.Background(), dir)

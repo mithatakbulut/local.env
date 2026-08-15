@@ -35,9 +35,9 @@ server accepts the following non-secret settings:
 | --- | --- | --- |
 | `LOCALENV_DATA_DIR` | `/data` | Persistent SQLite directory |
 | `LOCALENV_LISTEN_ADDR` | `:8080` | HTTP listener address |
-| `LOCALENV_DISPLAY_NAME` | `local.env` | Future dashboard branding |
-| `LOCALENV_LOGO_URL` | unset | Future dashboard branding |
-| `LOCALENV_FAVICON_URL` | unset | Future dashboard branding |
+| `LOCALENV_DISPLAY_NAME` | `local.env` | Dashboard title and text mark |
+| `LOCALENV_LOGO_URL` | unset | HTTPS dashboard logo; falls back to the text mark if unavailable |
+| `LOCALENV_FAVICON_URL` | unset | HTTPS dashboard favicon |
 
 ## GitHub App setup (P1)
 

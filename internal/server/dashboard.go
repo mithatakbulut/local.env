@@ -2,11 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
 	"sort"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/localenv/localenv/internal/githubapp"
@@ -20,7 +21,7 @@ type dashboardStore interface {
 	DashboardRepositories(context.Context) ([]sqlite.DashboardRepository, error)
 	DashboardRepository(context.Context, string, string) (sqlite.DashboardRepository, error)
 	DashboardPullRequest(context.Context, string, string, int) (sqlite.DashboardPullRequest, error)
-	DashboardDevices(context.Context) ([]sqlite.RepositoryDevice, error)
+	DashboardDevices(context.Context) ([]sqlite.DashboardDevice, error)
 	DashboardAuditEvents(context.Context, int) ([]sqlite.AuditEvent, error)
 }
 
@@ -85,7 +86,7 @@ func (s *Server) dashboardRepositories(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	s.renderDashboard(w, dashboardPage{Title: "Repositories", User: session.User.Login, Repositories: repositories})
+	s.renderDashboard(w, r, dashboardPage{Title: "Repositories", User: session.User.Login, RepositoryList: true, Repositories: repositories})
 }
 
 func (s *Server) dashboardRepository(w http.ResponseWriter, r *http.Request) {
@@ -98,7 +99,7 @@ func (s *Server) dashboardRepository(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderDashboard(w, dashboardPage{Title: repository.Owner + "/" + repository.Name, User: session.User.Login, Repository: &repository})
+	s.renderDashboard(w, r, dashboardPage{Title: repository.Owner + "/" + repository.Name, User: session.User.Login, Repository: &repository})
 }
 
 func (s *Server) dashboardPullRequest(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +117,7 @@ func (s *Server) dashboardPullRequest(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderDashboard(w, dashboardPage{Title: fmt.Sprintf("PR #%d", pull.Number), User: session.User.Login, PullRequest: &pull, Owner: r.PathValue("owner"), Repo: r.PathValue("repo")})
+	s.renderDashboard(w, r, dashboardPage{Title: fmt.Sprintf("PR #%d", pull.Number), User: session.User.Login, PullRequest: &pull, Owner: r.PathValue("owner"), Repo: r.PathValue("repo")})
 }
 
 func (s *Server) dashboardDevices(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +130,7 @@ func (s *Server) dashboardDevices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	s.renderDashboard(w, dashboardPage{Title: "Devices", User: session.User.Login, Devices: devices})
+	s.renderDashboard(w, r, dashboardPage{Title: "Devices", User: session.User.Login, DeviceList: true, Devices: devices})
 }
 
 func (s *Server) dashboardAudit(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +152,7 @@ func (s *Server) dashboardAudit(w http.ResponseWriter, r *http.Request) {
 		sort.Slice(metadata, func(i, j int) bool { return metadata[i].Key < metadata[j].Key })
 		view = append(view, dashboardAuditEvent{AuditEvent: event, Metadata: metadata})
 	}
-	s.renderDashboard(w, dashboardPage{Title: "Audit", User: session.User.Login, AuditEvents: view})
+	s.renderDashboard(w, r, dashboardPage{Title: "Audit", User: session.User.Login, AuditList: true, AuditEvents: view})
 }
 
 func (s *Server) dashboardSettings(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +160,7 @@ func (s *Server) dashboardSettings(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.renderDashboard(w, dashboardPage{Title: "Settings", User: session.User.Login, PublicURL: s.config.PublicURL.String(), DisplayName: s.config.DisplayName})
+	s.renderDashboard(w, r, dashboardPage{Title: "Settings", User: session.User.Login, PublicURL: s.config.PublicURL.String(), DisplayName: s.config.DisplayName})
 }
 
 type dashboardMetadata struct{ Key, Value string }
@@ -168,27 +169,279 @@ type dashboardAuditEvent struct {
 	Metadata []dashboardMetadata
 }
 type dashboardPage struct {
-	Title        string
-	User         string
-	Repositories []sqlite.DashboardRepository
-	Repository   *sqlite.DashboardRepository
-	PullRequest  *sqlite.DashboardPullRequest
-	Devices      []sqlite.RepositoryDevice
-	AuditEvents  []dashboardAuditEvent
-	Owner        string
-	Repo         string
-	PublicURL    string
-	DisplayName  string
+	Title          string
+	User           string
+	RepositoryList bool
+	Repositories   []sqlite.DashboardRepository
+	Repository     *sqlite.DashboardRepository
+	PullRequest    *sqlite.DashboardPullRequest
+	DeviceList     bool
+	Devices        []sqlite.DashboardDevice
+	AuditList      bool
+	AuditEvents    []dashboardAuditEvent
+	Owner          string
+	Repo           string
+	PublicURL      string
+	DisplayName    string
+	FaviconURL     string
+	Bootstrap      string
+	Stylesheet     string
+	Script         string
+	ReactView      bool
 }
 
-var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.FuncMap{"formatTime": func(value time.Time) string {
-	if value.IsZero() {
-		return "—"
-	}
-	return value.UTC().Format(time.RFC3339)
-}, "number": strconv.Itoa}).Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{{.Title}} · local.env</title></head><body><header><a href="/repos">local.env</a> · {{.User}} <nav><a href="/repos">Repositories</a> <a href="/devices">Devices</a> <a href="/audit">Audit</a> <a href="/settings">Settings</a></nav></header><main><h1>{{.Title}}</h1>{{if .Repositories}}<ul>{{range .Repositories}}<li><a href="/repos/{{.Owner}}/{{.Name}}">{{.Owner}}/{{.Name}}</a> — revision {{.Revision}}, {{.ManagedKeyCount}} encrypted managed keys, {{.OpenPullRequestCnt}} open PRs</li>{{end}}</ul>{{else if .Repository}}<p>Repository: {{.Repository.Owner}}/{{.Repository.Name}}</p><p>Current baseline revision: {{.Repository.Revision}} · Active key epoch: {{.Repository.ActiveKeyEpoch}} · Managed keys: {{.Repository.ManagedKeyCount}}</p><h2>Files</h2><ul>{{range .Repository.Files}}<li>Schema: {{.SchemaPath}} → Target: {{.TargetPath}}</li>{{end}}</ul><h2>Open PRs with env changes</h2><ul>{{range .Repository.OpenPullRequests}}<li><a href="/repos/{{$.Repository.Owner}}/{{$.Repository.Name}}/pulls/{{.Number}}">PR #{{.Number}}</a> ({{.State}})</li>{{else}}<li>None</li>{{end}}</ul><p>Secret plaintext is never shown in this dashboard.</p>{{else if .PullRequest}}<p><a href="/repos/{{.Owner}}/{{.Repo}}">{{.Owner}}/{{.Repo}}</a></p><p>PR #{{.PullRequest.Number}} — {{.PullRequest.State}}</p><table><thead><tr><th>Key</th><th>State</th></tr></thead><tbody>{{range .PullRequest.Requirements}}<tr><td>{{.KeyName}}</td><td>{{.State}}</td></tr>{{else}}<tr><td colspan="2">No environment requirements.</td></tr>{{end}}</tbody></table><p>Resolve missing keys using <code>localenv resolve</code>. This UI never accepts secret values.</p>{{else if .Devices}}<table><thead><tr><th>User</th><th>Device</th><th>Fingerprint</th><th>Active repo key</th></tr></thead><tbody>{{range .Devices}}<tr><td>{{.GitHubLogin}}</td><td>{{.Name}}</td><td>{{.Fingerprint}}</td><td>{{.HasKey}}</td></tr>{{end}}</tbody></table>{{else if .AuditEvents}}<table><thead><tr><th>Time</th><th>Event</th><th>Actor device</th><th>Metadata</th></tr></thead><tbody>{{range .AuditEvents}}<tr><td>{{formatTime .CreatedAt}}</td><td>{{.EventType}}</td><td>{{.ActorDeviceID}}</td><td>{{range .Metadata}}{{.Key}}={{.Value}} {{end}}</td></tr>{{end}}</tbody></table>{{else if .PublicURL}}<p>Instance: {{.DisplayName}}</p><p>Public URL: {{.PublicURL}}</p><p>Telemetry: disabled; this self-hosted build has no phone-home behavior.</p><p>Secrets are managed only by the CLI; dashboard configuration contains no secret editor.</p>{{else}}<p>No managed repositories have been discovered yet.</p>{{end}}</main></body></html>`))
+type dashboardBootstrap struct {
+	DisplayName string        `json:"display_name"`
+	LogoURL     string        `json:"logo_url,omitempty"`
+	Path        string        `json:"path"`
+	Title       string        `json:"title"`
+	User        string        `json:"user"`
+	View        dashboardView `json:"view"`
+}
 
-func (s *Server) renderDashboard(w http.ResponseWriter, page dashboardPage) {
+// dashboardView is a deliberately narrow browser contract. It contains only
+// public repository metadata and readiness state; secret records, ciphertext,
+// wrapped keys, sessions, and plaintext are intentionally not representable.
+type dashboardView struct {
+	Kind         string                    `json:"kind"`
+	Repositories []dashboardRepositoryView `json:"repositories"`
+	Repository   *dashboardRepositoryView  `json:"repository,omitempty"`
+	PullRequest  *dashboardPullRequestView `json:"pull_request,omitempty"`
+	Devices      []dashboardDeviceView     `json:"devices"`
+	AuditEvents  []dashboardAuditEventView `json:"audit_events"`
+	Settings     *dashboardSettingsView    `json:"settings,omitempty"`
+	Setup        *dashboardSetupView       `json:"setup,omitempty"`
+	Owner        string                    `json:"owner,omitempty"`
+	Repo         string                    `json:"repo,omitempty"`
+}
+
+type dashboardRepositoryView struct {
+	Owner                   string                     `json:"owner"`
+	Name                    string                     `json:"name"`
+	DefaultBranch           string                     `json:"default_branch"`
+	ActiveKeyEpoch          int64                      `json:"active_key_epoch"`
+	Revision                int64                      `json:"revision"`
+	ManagedKeyCount         int                        `json:"managed_key_count"`
+	OpenPullRequestCount    int                        `json:"open_pull_request_count"`
+	MissingRequirementCount int                        `json:"missing_requirement_count"`
+	Files                   []dashboardFileView        `json:"files"`
+	OpenPullRequests        []dashboardPullRequestView `json:"open_pull_requests"`
+}
+
+type dashboardFileView struct {
+	SchemaPath string `json:"schema_path"`
+	TargetPath string `json:"target_path"`
+}
+
+type dashboardPullRequestView struct {
+	Number                  int                        `json:"number"`
+	State                   string                     `json:"state"`
+	MissingRequirementCount int                        `json:"missing_requirement_count"`
+	Requirements            []dashboardRequirementView `json:"requirements"`
+}
+
+type dashboardRequirementView struct {
+	KeyName string `json:"key_name"`
+	State   string `json:"state"`
+}
+
+type dashboardDeviceView struct {
+	ID          string `json:"id"`
+	GitHubLogin string `json:"github_login"`
+	Name        string `json:"name"`
+	Fingerprint string `json:"fingerprint"`
+	CreatedAt   string `json:"created_at"`
+	LastSeenAt  string `json:"last_seen_at"`
+	RevokedAt   string `json:"revoked_at,omitempty"`
+	HasKey      bool   `json:"has_key"`
+}
+
+type dashboardAuditEventView struct {
+	EventType     string              `json:"event_type"`
+	ActorDeviceID string              `json:"actor_device_id"`
+	Metadata      []dashboardMetadata `json:"metadata"`
+	CreatedAt     string              `json:"created_at"`
+}
+
+type dashboardSettingsView struct {
+	PublicURL string `json:"public_url"`
+}
+
+// dashboardSetupView carries only the existing setup page's display values
+// and normal-form inputs. Its CSRF token is already rendered in the HTML form
+// contract and remains verified against the signed setup cookie by Go.
+type dashboardSetupView struct {
+	State          string                        `json:"state"`
+	SignInURL      string                        `json:"sign_in_url,omitempty"`
+	CSRFToken      string                        `json:"csrf_token,omitempty"`
+	Organizations  []dashboardOrganizationView   `json:"organizations"`
+	AppURL         string                        `json:"app_url,omitempty"`
+	Repositories   []dashboardDiscoveredRepoView `json:"repositories"`
+	ManifestAction string                        `json:"manifest_action,omitempty"`
+	Manifest       string                        `json:"manifest,omitempty"`
+}
+
+type dashboardOrganizationView struct {
+	ID    int64  `json:"id"`
+	Login string `json:"login"`
+}
+
+type dashboardDiscoveredRepoView struct {
+	Owner string `json:"owner"`
+	Name  string `json:"name"`
+}
+
+var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · {{.DisplayName}}</title>
+  {{if .FaviconURL}}<link rel="icon" href="{{.FaviconURL}}">{{end}}
+  <link rel="stylesheet" href="/assets/{{.Stylesheet}}">
+</head>
+<body>
+  <div id="dashboard-shell" data-dashboard="{{.Bootstrap}}"></div>
+  <main id="dashboard-content" tabindex="-1"><div id="dashboard-page"></div></main>
+  <script type="module" src="/assets/{{.Script}}"></script>
+</body>
+</html>`))
+
+func (s *Server) renderDashboard(w http.ResponseWriter, r *http.Request, page dashboardPage) {
+	assets, err := dashboardShellAssets()
+	if err != nil {
+		http.Error(w, "dashboard assets are unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	page.DisplayName = dashboardDisplayName(s.config.DisplayName)
+	logoURL := brandingURLString(s.config.LogoURL)
+	view := dashboardViewForPage(page)
+	bootstrap, err := json.Marshal(dashboardBootstrap{DisplayName: page.DisplayName, LogoURL: logoURL, Path: r.URL.Path, Title: page.Title, User: page.User, View: view})
+	if err != nil {
+		http.Error(w, "dashboard metadata is unavailable", http.StatusInternalServerError)
+		return
+	}
+	page.Bootstrap = string(bootstrap)
+	page.ReactView = true
+	page.FaviconURL = brandingURLString(s.config.FaviconURL)
+	page.Stylesheet = assets.Stylesheet
+	page.Script = assets.Script
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = dashboardTemplate.Execute(w, page)
+}
+
+func dashboardViewForPage(page dashboardPage) dashboardView {
+	switch {
+	case page.RepositoryList:
+		view := dashboardView{Kind: "repositories", Repositories: make([]dashboardRepositoryView, 0, len(page.Repositories))}
+		for _, repository := range page.Repositories {
+			view.Repositories = append(view.Repositories, dashboardRepositoryViewFor(repository))
+		}
+		return view
+	case page.Repository != nil:
+		return dashboardView{Kind: "repository", Repository: dashboardRepositoryViewPtr(*page.Repository)}
+	case page.PullRequest != nil:
+		return dashboardView{Kind: "pull_request", PullRequest: dashboardPullRequestViewPtr(*page.PullRequest), Owner: page.Owner, Repo: page.Repo}
+	case page.DeviceList:
+		view := dashboardView{Kind: "devices", Devices: make([]dashboardDeviceView, 0, len(page.Devices))}
+		for _, device := range page.Devices {
+			view.Devices = append(view.Devices, dashboardDeviceViewFor(device))
+		}
+		return view
+	case page.AuditList:
+		view := dashboardView{Kind: "audit", AuditEvents: make([]dashboardAuditEventView, 0, len(page.AuditEvents))}
+		for _, event := range page.AuditEvents {
+			view.AuditEvents = append(view.AuditEvents, dashboardAuditEventViewFor(event))
+		}
+		return view
+	case page.PublicURL != "":
+		return dashboardView{Kind: "settings", Settings: &dashboardSettingsView{PublicURL: page.PublicURL}}
+	default:
+		return dashboardView{Kind: "legacy"}
+	}
+}
+
+func dashboardRepositoryViewPtr(repository sqlite.DashboardRepository) *dashboardRepositoryView {
+	view := dashboardRepositoryViewFor(repository)
+	return &view
+}
+
+func dashboardRepositoryViewFor(repository sqlite.DashboardRepository) dashboardRepositoryView {
+	view := dashboardRepositoryView{
+		Owner: repository.Owner, Name: repository.Name, DefaultBranch: repository.DefaultBranch,
+		ActiveKeyEpoch: repository.ActiveKeyEpoch, Revision: repository.Revision,
+		ManagedKeyCount: repository.ManagedKeyCount, OpenPullRequestCount: repository.OpenPullRequestCnt,
+		MissingRequirementCount: repository.MissingRequirementCnt,
+		Files:                   make([]dashboardFileView, 0, len(repository.Files)),
+		OpenPullRequests:        make([]dashboardPullRequestView, 0, len(repository.OpenPullRequests)),
+	}
+	for _, file := range repository.Files {
+		view.Files = append(view.Files, dashboardFileView{SchemaPath: file.SchemaPath, TargetPath: file.TargetPath})
+	}
+	for _, pull := range repository.OpenPullRequests {
+		view.OpenPullRequests = append(view.OpenPullRequests, dashboardPullRequestViewFor(pull))
+	}
+	return view
+}
+
+func dashboardPullRequestViewPtr(pull sqlite.DashboardPullRequest) *dashboardPullRequestView {
+	view := dashboardPullRequestViewFor(pull)
+	return &view
+}
+
+func dashboardPullRequestViewFor(pull sqlite.DashboardPullRequest) dashboardPullRequestView {
+	view := dashboardPullRequestView{Number: pull.Number, State: pull.State, MissingRequirementCount: pull.MissingRequirementCnt, Requirements: make([]dashboardRequirementView, 0, len(pull.Requirements))}
+	for _, requirement := range pull.Requirements {
+		view.Requirements = append(view.Requirements, dashboardRequirementView{KeyName: requirement.KeyName, State: requirement.State})
+	}
+	return view
+}
+
+func dashboardDeviceViewFor(device sqlite.DashboardDevice) dashboardDeviceView {
+	view := dashboardDeviceView{ID: device.ID, GitHubLogin: device.GitHubLogin, Name: device.Name, Fingerprint: device.Fingerprint, CreatedAt: dashboardTime(device.CreatedAt), LastSeenAt: dashboardTime(device.LastSeenAt), HasKey: device.HasKey}
+	if device.RevokedAt != nil {
+		view.RevokedAt = dashboardTime(*device.RevokedAt)
+	}
+	return view
+}
+
+func dashboardAuditEventViewFor(event dashboardAuditEvent) dashboardAuditEventView {
+	return dashboardAuditEventView{EventType: event.EventType, ActorDeviceID: event.ActorDeviceID, Metadata: event.Metadata, CreatedAt: dashboardTime(event.CreatedAt)}
+}
+
+func dashboardTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func dashboardViewForSetup(page setupPage) dashboardView {
+	view := dashboardSetupView{Organizations: make([]dashboardOrganizationView, 0, len(page.Organizations)), Repositories: make([]dashboardDiscoveredRepoView, 0, len(page.Repositories))}
+	switch {
+	case page.ConfigurationRequired:
+		view.State = "configuration_required"
+	case page.ManifestAction != "":
+		view.State, view.ManifestAction, view.Manifest = "manifest_post", page.ManifestAction, page.Manifest
+	case page.Complete:
+		view.State, view.AppURL = "complete", page.AppURL
+	case page.SignInURL != "":
+		view.State, view.SignInURL = "sign_in", page.SignInURL
+	default:
+		view.State, view.CSRFToken = "organization_selection", page.CSRFToken
+	}
+	for _, organization := range page.Organizations {
+		view.Organizations = append(view.Organizations, dashboardOrganizationView{ID: organization.ID, Login: organization.Login})
+	}
+	for _, repository := range page.Repositories {
+		view.Repositories = append(view.Repositories, dashboardDiscoveredRepoView{Owner: repository.Owner, Name: repository.Name})
+	}
+	return dashboardView{Kind: "setup", Setup: &view}
+}
+
+func dashboardDisplayName(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "local.env"
+	}
+	return value
 }

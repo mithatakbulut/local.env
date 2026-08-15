@@ -7,5 +7,7 @@ docs/
 !docs/
 docs/*
 !docs/cli.md
+!docs/dashboard-ui-plan.md
 !docs/installation.md
 !docs/security-model.md
+frontend/node_modules/
