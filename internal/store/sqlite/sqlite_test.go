@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -271,6 +272,105 @@ func TestRepositoryCryptoBootstrapStoresOnlyWrappedREK(t *testing.T) {
 	}
 	if _, err := store.InitializeRepositoryCrypto(ctx, "acme", "api", user.ID, device.ID, wrapped); !errors.Is(err, ErrRepositoryAlreadyInitialized) {
 		t.Fatalf("second bootstrap error = %v, want already initialized", err)
+	}
+}
+
+func TestDeviceAccessApprovalRewrapsLocallyAndRevocationStopsSnapshots(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	if err := store.ConfigureGitHubInstance(ctx, 2, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRepositoryConfigSnapshot(ctx, RepositoryConfigSnapshot{GitHubRepoID: 17, Owner: "acme", Name: "api", DefaultBranch: "main", Files: []RepositoryFile{{SchemaPath: ".env.example", TargetPath: ".env.local"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installations(github_installation_id, created_at) VALUES (7, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO github_installation_repositories(github_repo_id, github_installation_id, owner, name, default_branch, active, updated_at) VALUES (17, 7, 'acme', 'api', 'main', 1, ?)`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	approver := githubapp.User{ID: 41, Login: "approver"}
+	requester := githubapp.User{ID: 42, Login: "new-developer"}
+	if err := store.CreateSession(ctx, approver, "non-secret-approver-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, requester, "non-secret-requester-session", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	approverIdentity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requesterIdentity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approverDevice, err := store.RegisterDevice(ctx, "non-secret-approver-session", "device-approver", "approver laptop", approverIdentity.Recipient().String(), "sha256:approver")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requesterDevice, err := store.RegisterDevice(ctx, "non-secret-requester-session", "device-requester", "new laptop", requesterIdentity.Recipient().String(), "sha256:requester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rek := []byte("non-secret-test-rek-sentinel-000")
+	wrappedForApprover, err := cryptokit.WrapREK(rek, approverIdentity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InitializeRepositoryCrypto(ctx, "acme", "api", approver.ID, approverDevice.ID, wrappedForApprover); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", requester.ID, requesterDevice.ID); err == nil {
+		t.Fatal("unapproved device received a repository snapshot")
+	}
+	code := "non-secret-device-approval-code"
+	request, err := store.CreateDeviceAccessRequest(ctx, "acme", "api", requester.ID, requesterDevice.ID, code)
+	if err != nil || request.GitHubLogin != requester.Login || request.Fingerprint != "sha256:requester" {
+		t.Fatalf("CreateDeviceAccessRequest() = %#v, %v", request, err)
+	}
+	if _, err := store.DeviceAccessRequestForCode(ctx, "acme", "api", code); err != nil {
+		t.Fatal(err)
+	}
+	wrappedForRequester, err := cryptokit.WrapREK(rek, requesterIdentity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDeviceAccess(ctx, "acme", "api", approver.ID, approverDevice.ID, code, wrappedForRequester); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", requester.ID, requesterDevice.ID)
+	if err != nil {
+		t.Fatalf("approved device snapshot: %v", err)
+	}
+	unwrapped, err := cryptokit.UnwrapREK(requesterIdentity, snapshot.WrappedREK)
+	if err != nil || !bytes.Equal(unwrapped, rek) {
+		t.Fatalf("approved device REK = %q, %v", unwrapped, err)
+	}
+	for i := range unwrapped {
+		unwrapped[i] = 0
+	}
+	var storedCode string
+	if err := store.db.QueryRow(`SELECT CAST(code_hash AS TEXT) FROM device_access_requests WHERE id = ?`, request.ID).Scan(&storedCode); err != nil || strings.Contains(storedCode, code) {
+		t.Fatalf("stored approval code = %q, %v", storedCode, err)
+	}
+	var auditCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE event_type IN ('device.access_requested', 'device.access_approved')`).Scan(&auditCount); err != nil || auditCount != 2 {
+		t.Fatalf("device sharing audit count = %d, %v", auditCount, err)
+	}
+	if err := store.RevokeDevice(ctx, approver.ID, approverDevice.ID, requesterDevice.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", requester.ID, requesterDevice.ID); err == nil {
+		t.Fatal("revoked device received a repository snapshot")
+	}
+	if _, err := store.AuthenticateSession(ctx, "non-secret-requester-session"); err == nil {
+		t.Fatal("revoked device session authenticated")
 	}
 }
 

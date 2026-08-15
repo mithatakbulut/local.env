@@ -78,6 +78,15 @@ type encryptedSecretStore interface {
 	UpdateBaselineSecret(context.Context, string, string, int64, string, string, string, int64, sqlite.SecretEnvelope) error
 }
 
+type deviceSharingStore interface {
+	CreateDeviceAccessRequest(context.Context, string, string, int64, string, string) (sqlite.DeviceAccessRequest, error)
+	PendingDeviceAccessRequests(context.Context, string, string) ([]sqlite.DeviceAccessRequest, error)
+	DeviceAccessRequestForCode(context.Context, string, string, string) (sqlite.DeviceAccessRequest, error)
+	ApproveDeviceAccess(context.Context, string, string, int64, string, string, []byte) error
+	RepositoryDevices(context.Context, string, string) ([]sqlite.RepositoryDevice, error)
+	RevokeDevice(context.Context, int64, string, string) error
+}
+
 // Server holds dependencies for HTTP handlers.
 type Server struct {
 	config      config.Config
@@ -113,6 +122,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/me", s.me)
 	mux.HandleFunc("POST /api/v1/devices", s.registerDevice)
 	mux.HandleFunc("GET /api/v1/devices", s.devices)
+	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/device-access-requests", s.createDeviceAccessRequest)
+	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/device-access-requests", s.pendingDeviceAccessRequests)
+	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/device-access-requests/inspect", s.inspectDeviceAccessRequest)
+	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/device-access-requests/approve", s.approveDeviceAccess)
+	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/devices", s.repositoryDevices)
+	mux.HandleFunc("DELETE /api/v1/repos/{owner}/{repo}/devices/{id}", s.revokeDevice)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}", s.repositoryCryptoState)
 	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/init", s.initializeRepositoryCrypto)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/snapshot", s.repositorySnapshot)
@@ -692,6 +707,142 @@ func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, devices)
+}
+
+func (s *Server) deviceAccessState(w http.ResponseWriter, r *http.Request) (sqlite.AuthenticatedSession, sqlite.RepositoryCryptoState, deviceSharingStore, bool) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return sqlite.AuthenticatedSession{}, sqlite.RepositoryCryptoState{}, nil, false
+	}
+	store, ok := s.store.(deviceSharingStore)
+	if !ok {
+		http.Error(w, "device sharing persistence is unavailable", http.StatusServiceUnavailable)
+		return sqlite.AuthenticatedSession{}, sqlite.RepositoryCryptoState{}, nil, false
+	}
+	stateStore, ok := s.store.(repositoryCryptoStore)
+	if !ok {
+		http.Error(w, "repository authorization is unavailable", http.StatusServiceUnavailable)
+		return sqlite.AuthenticatedSession{}, sqlite.RepositoryCryptoState{}, nil, false
+	}
+	state, err := stateStore.RepositoryCryptoState(r.Context(), r.PathValue("owner"), r.PathValue("repo"))
+	if errors.Is(err, sqlite.ErrRepositoryNotManaged) {
+		http.NotFound(w, r)
+		return sqlite.AuthenticatedSession{}, sqlite.RepositoryCryptoState{}, nil, false
+	}
+	if err != nil || !state.Initialized {
+		http.Error(w, "repository encryption is unavailable", http.StatusBadRequest)
+		return sqlite.AuthenticatedSession{}, sqlite.RepositoryCryptoState{}, nil, false
+	}
+	if authenticated.Device.ID == "" || !s.authorizeRepository(w, r, state, authenticated.User) {
+		return sqlite.AuthenticatedSession{}, sqlite.RepositoryCryptoState{}, nil, false
+	}
+	return authenticated, state, store, true
+}
+
+func (s *Server) createDeviceAccessRequest(w http.ResponseWriter, r *http.Request) {
+	authenticated, state, store, ok := s.deviceAccessState(w, r)
+	if !ok {
+		return
+	}
+	code, err := randomToken()
+	if err != nil {
+		http.Error(w, "could not create device access request", http.StatusInternalServerError)
+		return
+	}
+	request, err := store.CreateDeviceAccessRequest(r.Context(), state.Owner, state.Name, authenticated.User.ID, authenticated.Device.ID, code)
+	if err != nil {
+		http.Error(w, "device access request was rejected", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		sqlite.DeviceAccessRequest
+		Code string `json:"code"`
+	}{DeviceAccessRequest: request, Code: code})
+}
+
+func (s *Server) pendingDeviceAccessRequests(w http.ResponseWriter, r *http.Request) {
+	_, state, store, ok := s.deviceAccessState(w, r)
+	if !ok {
+		return
+	}
+	requests, err := store.PendingDeviceAccessRequests(r.Context(), state.Owner, state.Name)
+	if err != nil {
+		http.Error(w, "pending device access requests are unavailable", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, requests)
+}
+
+func (s *Server) inspectDeviceAccessRequest(w http.ResponseWriter, r *http.Request) {
+	_, state, store, ok := s.deviceAccessState(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		Code string `json:"code"`
+	}
+	if !decodeRequestJSON(w, r, &request) {
+		return
+	}
+	access, err := store.DeviceAccessRequestForCode(r.Context(), state.Owner, state.Name, request.Code)
+	if errors.Is(err, sqlite.ErrDeviceAccessNotFound) {
+		http.Error(w, "device access request was not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "device access request is unavailable", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, access)
+}
+
+func (s *Server) approveDeviceAccess(w http.ResponseWriter, r *http.Request) {
+	authenticated, state, store, ok := s.deviceAccessState(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		Code       string `json:"code"`
+		WrappedREK []byte `json:"wrapped_rek"`
+	}
+	if !decodeRequestJSON(w, r, &request) {
+		return
+	}
+	err := store.ApproveDeviceAccess(r.Context(), state.Owner, state.Name, authenticated.User.ID, authenticated.Device.ID, request.Code, request.WrappedREK)
+	if errors.Is(err, sqlite.ErrDeviceAccessNotFound) {
+		http.Error(w, "device access request was not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "device access approval was rejected", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) repositoryDevices(w http.ResponseWriter, r *http.Request) {
+	_, state, store, ok := s.deviceAccessState(w, r)
+	if !ok {
+		return
+	}
+	devices, err := store.RepositoryDevices(r.Context(), state.Owner, state.Name)
+	if err != nil {
+		http.Error(w, "repository devices are unavailable", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, devices)
+}
+
+func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, store, ok := s.deviceAccessState(w, r)
+	if !ok {
+		return
+	}
+	if err := store.RevokeDevice(r.Context(), authenticated.User.ID, authenticated.Device.ID, r.PathValue("id")); err != nil {
+		http.Error(w, "device revocation was rejected", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) cliLogout(w http.ResponseWriter, r *http.Request) {

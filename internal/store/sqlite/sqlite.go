@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ var (
 	ErrRepositoryAlreadyInitialized = errors.New("repository encryption is already initialized")
 	ErrSecretVersionConflict        = errors.New("secret version conflict")
 	ErrPullRequestNotOpen           = errors.New("pull request is not open")
+	ErrDeviceAccessNotFound         = errors.New("device access request not found")
 )
 
 // Store owns a single SQLite connection. A single connection keeps connection
@@ -117,6 +119,25 @@ type RepositorySnapshot struct {
 	Repository RepositoryCryptoState `json:"repository"`
 	WrappedREK []byte                `json:"wrapped_rek"`
 	Secrets    []SecretSnapshot      `json:"secrets"`
+}
+
+// DeviceAccessRequest contains only public identity metadata. The approval
+// code is intentionally never stored in this type or in SQLite as plaintext.
+type DeviceAccessRequest struct {
+	ID              string    `json:"id"`
+	GitHubUserID    int64     `json:"github_user_id"`
+	GitHubLogin     string    `json:"github_login"`
+	DeviceID        string    `json:"device_id"`
+	DeviceName      string    `json:"device_name"`
+	PublicRecipient string    `json:"public_recipient"`
+	Fingerprint     string    `json:"fingerprint"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+type RepositoryDevice struct {
+	Device
+	GitHubLogin string `json:"github_login"`
+	HasKey      bool   `json:"has_key"`
 }
 
 // CreateAuthExchange records a one-time, short-lived CLI exchange code by
@@ -288,6 +309,245 @@ func (s *Store) DevicesForUser(ctx context.Context, githubUserID int64) ([]Devic
 		return nil, fmt.Errorf("iterate devices: %w", err)
 	}
 	return devices, nil
+}
+
+// CreateDeviceAccessRequest records a fresh, code-hash-only request when an
+// authenticated device has GitHub access but no wrapped key for this repo.
+func (s *Store) CreateDeviceAccessRequest(ctx context.Context, owner, name string, githubUserID int64, deviceID, code string) (DeviceAccessRequest, error) {
+	if githubUserID <= 0 || deviceID == "" || len(code) < 16 || !validRepositoryName(owner) || !validRepositoryName(name) {
+		return DeviceAccessRequest{}, errors.New("invalid device access request")
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil || !state.Initialized {
+		return DeviceAccessRequest{}, errors.New("repository encryption is not initialized")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return DeviceAccessRequest{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeviceAccessRequest{}, fmt.Errorf("begin device access request: %w", err)
+	}
+	defer tx.Rollback()
+	var request DeviceAccessRequest
+	err = tx.QueryRowContext(ctx, `SELECT d.id, d.github_user_id, u.login, d.name, d.public_recipient, d.fingerprint FROM devices d JOIN github_users u ON u.github_user_id = d.github_user_id WHERE d.id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL`, deviceID, githubUserID).Scan(&request.DeviceID, &request.GitHubUserID, &request.GitHubLogin, &request.DeviceName, &request.PublicRecipient, &request.Fingerprint)
+	if err != nil {
+		return DeviceAccessRequest{}, errors.New("active device is required")
+	}
+	var hasKey bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wrapped_repo_keys WHERE repository_id = ? AND epoch = ? AND device_id = ?)`, repositoryID, state.ActiveKeyEpoch, deviceID).Scan(&hasKey); err != nil {
+		return DeviceAccessRequest{}, fmt.Errorf("check existing device access: %w", err)
+	}
+	if hasKey {
+		return DeviceAccessRequest{}, errors.New("device already has repository access")
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE device_access_requests SET status = 'revoked', revoked_at = ? WHERE repository_id = ? AND device_id = ? AND status = 'pending'`, now, repositoryID, deviceID); err != nil {
+		return DeviceAccessRequest{}, fmt.Errorf("replace pending device access request: %w", err)
+	}
+	request.ID, err = newUUID()
+	if err != nil {
+		return DeviceAccessRequest{}, err
+	}
+	request.CreatedAt = now
+	if _, err := tx.ExecContext(ctx, `INSERT INTO device_access_requests(id, repository_id, device_id, code_hash, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)`, request.ID, repositoryID, deviceID, tokenHash(code), now); err != nil {
+		return DeviceAccessRequest{}, fmt.Errorf("store device access request: %w", err)
+	}
+	if err := insertAuditEvent(ctx, tx, githubUserID, deviceID, repositoryID, "device.access_requested", map[string]string{"target_device_id": deviceID}); err != nil {
+		return DeviceAccessRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeviceAccessRequest{}, fmt.Errorf("commit device access request: %w", err)
+	}
+	return request, nil
+}
+
+// PendingDeviceAccessRequests lists approval candidates without exposing
+// approval codes or any private key material.
+func (s *Store) PendingDeviceAccessRequests(ctx context.Context, owner, name string) ([]DeviceAccessRequest, error) {
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil || !state.Initialized {
+		return nil, errors.New("repository encryption is not initialized")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT r.id, d.github_user_id, u.login, d.id, d.name, d.public_recipient, d.fingerprint, r.created_at FROM device_access_requests r JOIN devices d ON d.id = r.device_id JOIN github_users u ON u.github_user_id = d.github_user_id WHERE r.repository_id = ? AND r.status = 'pending' AND d.revoked_at IS NULL ORDER BY r.created_at, r.id`, repositoryID)
+	if err != nil {
+		return nil, fmt.Errorf("list pending device access requests: %w", err)
+	}
+	defer rows.Close()
+	var result []DeviceAccessRequest
+	for rows.Next() {
+		var request DeviceAccessRequest
+		if err := rows.Scan(&request.ID, &request.GitHubUserID, &request.GitHubLogin, &request.DeviceID, &request.DeviceName, &request.PublicRecipient, &request.Fingerprint, &request.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan pending device access request: %w", err)
+		}
+		result = append(result, request)
+	}
+	return result, rows.Err()
+}
+
+// RepositoryDevices returns public active-device metadata and whether each
+// device has a wrapped key for the active epoch.
+func (s *Store) RepositoryDevices(ctx context.Context, owner, name string) ([]RepositoryDevice, error) {
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil || !state.Initialized {
+		return nil, errors.New("repository encryption is not initialized")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.github_user_id, u.login, d.name, d.public_recipient, d.fingerprint, d.created_at, d.last_seen_at, EXISTS(SELECT 1 FROM wrapped_repo_keys wr WHERE wr.repository_id = ? AND wr.epoch = ? AND wr.device_id = d.id) FROM devices d JOIN github_users u ON u.github_user_id = d.github_user_id WHERE d.revoked_at IS NULL ORDER BY d.created_at, d.id`, repositoryID, state.ActiveKeyEpoch)
+	if err != nil {
+		return nil, fmt.Errorf("list repository devices: %w", err)
+	}
+	defer rows.Close()
+	var result []RepositoryDevice
+	for rows.Next() {
+		var device RepositoryDevice
+		if err := rows.Scan(&device.ID, &device.GitHubUserID, &device.GitHubLogin, &device.Name, &device.PublicRecipient, &device.Fingerprint, &device.CreatedAt, &device.LastSeenAt, &device.HasKey); err != nil {
+			return nil, fmt.Errorf("scan repository device: %w", err)
+		}
+		result = append(result, device)
+	}
+	return result, rows.Err()
+}
+
+// DeviceAccessRequestForCode lets an approver inspect the exact public device
+// fingerprint before a local REK is unwrapped and re-wrapped.
+func (s *Store) DeviceAccessRequestForCode(ctx context.Context, owner, name, code string) (DeviceAccessRequest, error) {
+	if len(code) < 16 {
+		return DeviceAccessRequest{}, ErrDeviceAccessNotFound
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil || !state.Initialized {
+		return DeviceAccessRequest{}, ErrDeviceAccessNotFound
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return DeviceAccessRequest{}, err
+	}
+	var request DeviceAccessRequest
+	err = s.db.QueryRowContext(ctx, `SELECT r.id, d.github_user_id, u.login, d.id, d.name, d.public_recipient, d.fingerprint, r.created_at FROM device_access_requests r JOIN devices d ON d.id = r.device_id JOIN github_users u ON u.github_user_id = d.github_user_id WHERE r.repository_id = ? AND r.code_hash = ? AND r.status = 'pending' AND d.revoked_at IS NULL`, repositoryID, tokenHash(code)).Scan(&request.ID, &request.GitHubUserID, &request.GitHubLogin, &request.DeviceID, &request.DeviceName, &request.PublicRecipient, &request.Fingerprint, &request.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DeviceAccessRequest{}, ErrDeviceAccessNotFound
+	}
+	if err != nil {
+		return DeviceAccessRequest{}, fmt.Errorf("read device access request: %w", err)
+	}
+	return request, nil
+}
+
+// ApproveDeviceAccess stores a new per-device wrapped REK. It verifies the
+// approver already has the active wrapped REK; neither side sends plaintext.
+func (s *Store) ApproveDeviceAccess(ctx context.Context, owner, name string, actorUserID int64, actorDeviceID, code string, wrappedREK []byte) error {
+	if actorUserID <= 0 || actorDeviceID == "" || len(code) < 16 || len(wrappedREK) == 0 || len(wrappedREK) > 64<<10 {
+		return errors.New("invalid device approval")
+	}
+	state, err := s.RepositoryCryptoState(ctx, owner, name)
+	if err != nil || !state.Initialized {
+		return errors.New("repository encryption is not initialized")
+	}
+	repositoryID, err := s.repositoryID(ctx, state.GitHubRepoID)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin device approval: %w", err)
+	}
+	defer tx.Rollback()
+	var approved bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wrapped_repo_keys wr JOIN devices d ON d.id = wr.device_id WHERE wr.repository_id = ? AND wr.epoch = ? AND d.id = ? AND d.github_user_id = ? AND d.revoked_at IS NULL)`, repositoryID, state.ActiveKeyEpoch, actorDeviceID, actorUserID).Scan(&approved); err != nil || !approved {
+		return errors.New("approving device does not have the repository key")
+	}
+	var targetDeviceID string
+	err = tx.QueryRowContext(ctx, `SELECT r.device_id FROM device_access_requests r JOIN devices d ON d.id = r.device_id WHERE r.repository_id = ? AND r.code_hash = ? AND r.status = 'pending' AND d.revoked_at IS NULL`, repositoryID, tokenHash(code)).Scan(&targetDeviceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrDeviceAccessNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read pending device access request: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wrapped_repo_keys(repository_id, epoch, device_id, wrapped_key, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(repository_id, epoch, device_id) DO NOTHING`, repositoryID, state.ActiveKeyEpoch, targetDeviceID, wrappedREK, now); err != nil {
+		return fmt.Errorf("store approved wrapped repository key: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE device_access_requests SET status = 'approved', approved_at = ?, approved_by_device_id = ? WHERE repository_id = ? AND code_hash = ? AND status = 'pending'`, now, actorDeviceID, repositoryID, tokenHash(code))
+	if err != nil {
+		return fmt.Errorf("approve device access request: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrDeviceAccessNotFound
+	}
+	if err := insertAuditEvent(ctx, tx, actorUserID, actorDeviceID, repositoryID, "device.access_approved", map[string]string{"target_device_id": targetDeviceID}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RevokeDevice removes every wrapped REK for a device and invalidates its
+// sessions. Existing local plaintext cannot be remotely erased.
+func (s *Store) RevokeDevice(ctx context.Context, actorUserID int64, actorDeviceID, targetDeviceID string) error {
+	if actorUserID <= 0 || actorDeviceID == "" || targetDeviceID == "" {
+		return errors.New("invalid device revocation")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin device revocation: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, now, targetDeviceID)
+	if err != nil {
+		return fmt.Errorf("revoke device: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("device is not active")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL`, now, targetDeviceID); err != nil {
+		return fmt.Errorf("revoke device sessions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM wrapped_repo_keys WHERE device_id = ?`, targetDeviceID); err != nil {
+		return fmt.Errorf("delete device wrapped repository keys: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE device_access_requests SET status = 'revoked', revoked_at = ? WHERE device_id = ? AND status = 'pending'`, now, targetDeviceID); err != nil {
+		return fmt.Errorf("revoke pending device access requests: %w", err)
+	}
+	if err := insertAuditEvent(ctx, tx, actorUserID, actorDeviceID, "", "device.revoked", map[string]string{"target_device_id": targetDeviceID}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertAuditEvent(ctx context.Context, tx *sql.Tx, actorUserID int64, actorDeviceID, repositoryID, eventType string, metadata map[string]string) error {
+	id, err := newUUID()
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	var user any
+	if actorUserID > 0 {
+		user = strconv.FormatInt(actorUserID, 10)
+	}
+	var device, repository any
+	if actorDeviceID != "" {
+		device = actorDeviceID
+	}
+	if repositoryID != "" {
+		repository = repositoryID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_events(id, actor_user_id, actor_device_id, repository_id, event_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, id, user, device, repository, eventType, string(encoded), time.Now().UTC()); err != nil {
+		return fmt.Errorf("store audit event: %w", err)
+	}
+	return nil
 }
 
 func tokenHash(token string) []byte { sum := sha256.Sum256([]byte(token)); return sum[:] }

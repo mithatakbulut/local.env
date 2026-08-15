@@ -138,7 +138,7 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 		case "/app/installations/7/access_tokens":
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"token":"installation-token"}`))
-		case "/repos/acme/api/collaborators/developer/permission":
+		case "/repos/acme/api/collaborators/developer/permission", "/repos/acme/api/collaborators/new-developer/permission":
 			_, _ = w.Write([]byte(`{"permission":"` + permission + `"}`))
 		case "/repos/acme/api/pulls":
 			_, _ = w.Write([]byte(`[{"number":100,"head":{"ref":"feature/sync"}}]`))
@@ -210,6 +210,69 @@ func TestRepositoryBootstrapRequiresGitHubWriteAccessAndStoresOnlyWrappedKey(t *
 	app.Handler().ServeHTTP(postRecorder, post)
 	if postRecorder.Code != http.StatusCreated || strings.Contains(postRecorder.Body.String(), string(rek)) {
 		t.Fatalf("bootstrap init = %d, %s", postRecorder.Code, postRecorder.Body.String())
+	}
+	newUser := githubapp.User{ID: 32, Login: "new-developer"}
+	newToken := "non-secret-new-device-session"
+	if err := store.CreateSession(ctx, newUser, newToken, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	newIdentity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RegisterDevice(ctx, newToken, "device-2", "new laptop", newIdentity.Recipient().String(), "sha256:new-device"); err != nil {
+		t.Fatal(err)
+	}
+	beforeApproval := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api/snapshot", nil)
+	beforeApproval.Header.Set("Authorization", "Bearer "+newToken)
+	beforeApprovalRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(beforeApprovalRecorder, beforeApproval)
+	if beforeApprovalRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("unapproved snapshot = %d, want 400", beforeApprovalRecorder.Code)
+	}
+	accessRequest := httptest.NewRequest(http.MethodPost, "/api/v1/repos/acme/api/device-access-requests", strings.NewReader(`{}`))
+	accessRequest.Header.Set("Content-Type", "application/json")
+	accessRequest.Header.Set("Authorization", "Bearer "+newToken)
+	accessRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(accessRecorder, accessRequest)
+	var access struct {
+		Code        string `json:"code"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if accessRecorder.Code != http.StatusCreated || json.Unmarshal(accessRecorder.Body.Bytes(), &access) != nil || access.Code == "" || access.Fingerprint != "sha256:new-device" || strings.Contains(accessRecorder.Body.String(), string(rek)) {
+		t.Fatalf("device access request = %d, %s", accessRecorder.Code, accessRecorder.Body.String())
+	}
+	inspectPayload, _ := json.Marshal(map[string]string{"code": access.Code})
+	inspect := httptest.NewRequest(http.MethodPost, "/api/v1/repos/acme/api/device-access-requests/inspect", bytes.NewReader(inspectPayload))
+	inspect.Header.Set("Content-Type", "application/json")
+	inspect.Header.Set("Authorization", "Bearer "+token)
+	inspectRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(inspectRecorder, inspect)
+	if inspectRecorder.Code != http.StatusOK || !strings.Contains(inspectRecorder.Body.String(), `"github_login":"new-developer"`) || !strings.Contains(inspectRecorder.Body.String(), `"fingerprint":"sha256:new-device"`) {
+		t.Fatalf("device access inspect = %d, %s", inspectRecorder.Code, inspectRecorder.Body.String())
+	}
+	wrappedForNewDevice, err := cryptokit.WrapREK(rek, newIdentity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvePayload, _ := json.Marshal(struct {
+		Code       string `json:"code"`
+		WrappedREK []byte `json:"wrapped_rek"`
+	}{access.Code, wrappedForNewDevice})
+	approve := httptest.NewRequest(http.MethodPost, "/api/v1/repos/acme/api/device-access-requests/approve", bytes.NewReader(approvePayload))
+	approve.Header.Set("Content-Type", "application/json")
+	approve.Header.Set("Authorization", "Bearer "+token)
+	approveRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(approveRecorder, approve)
+	if approveRecorder.Code != http.StatusNoContent {
+		t.Fatalf("device access approval = %d, %s", approveRecorder.Code, approveRecorder.Body.String())
+	}
+	afterApproval := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api/snapshot", nil)
+	afterApproval.Header.Set("Authorization", "Bearer "+newToken)
+	afterApprovalRecorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(afterApprovalRecorder, afterApproval)
+	if afterApprovalRecorder.Code != http.StatusOK || strings.Contains(afterApprovalRecorder.Body.String(), string(rek)) {
+		t.Fatalf("approved snapshot = %d, %s", afterApprovalRecorder.Code, afterApprovalRecorder.Body.String())
 	}
 	currentPull := httptest.NewRequest(http.MethodGet, "/api/v1/repos/acme/api/pulls/current?branch=feature%2Fsync", nil)
 	currentPull.Header.Set("Authorization", "Bearer "+token)

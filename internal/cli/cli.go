@@ -62,6 +62,8 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runSync(args[1:], out, errOut)
 	case "diff":
 		return runDiff(args[1:], out, errOut)
+	case "devices":
+		return runDevices(args[1:], out, errOut)
 	case "--version", "version":
 		return 0
 	case "--help", "help":
@@ -86,6 +88,7 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  import FILE           Encrypt declared values from a local dotenv file")
 	fmt.Fprintln(out, "  sync                  Download, decrypt, and safely update local dotenv files")
 	fmt.Fprintln(out, "  diff                  Show key-level local/remote dotenv differences")
+	fmt.Fprintln(out, "  devices               List, approve, or revoke repository devices")
 }
 
 func runSync(args []string, out, errOut io.Writer) int {
@@ -102,6 +105,11 @@ func runSync(args []string, out, errOut io.Writer) int {
 	}
 	remote, root, err := syncSnapshot(*repositoryFlag, *instanceFlag, *credentialFile, *pr)
 	if err != nil {
+		var pending deviceAccessPendingError
+		if errors.As(err, &pending) {
+			fmt.Fprintf(errOut, "Access pending. Approval code: %s\n", pending.Code)
+			return 1
+		}
 		fmt.Fprintln(errOut, "localenv: could not download and decrypt the repository snapshot")
 		return 1
 	}
@@ -130,6 +138,11 @@ func runDiff(args []string, out, errOut io.Writer) int {
 	}
 	remote, root, err := syncSnapshot(*repositoryFlag, *instanceFlag, *credentialFile, *pr)
 	if err != nil {
+		var pending deviceAccessPendingError
+		if errors.As(err, &pending) {
+			fmt.Fprintf(errOut, "Access pending. Approval code: %s\n", pending.Code)
+			return 1
+		}
 		fmt.Fprintln(errOut, "localenv: could not download and decrypt the repository snapshot")
 		return 1
 	}
@@ -141,6 +154,10 @@ func runDiff(args []string, out, errOut io.Writer) int {
 }
 
 type decryptedSnapshot map[string]map[string][]byte // target path -> key -> value
+
+type deviceAccessPendingError struct{ Code string }
+
+func (e deviceAccessPendingError) Error() string { return "device access is pending approval" }
 
 func syncSnapshot(repositoryFlag, instanceFlag, credentialFile string, pr int) (decryptedSnapshot, string, error) {
 	secrets, err := credentialStore(credentialFile)
@@ -183,6 +200,10 @@ func syncSnapshot(repositoryFlag, instanceFlag, credentialFile string, pr int) (
 		snapshot, err = fetchRepositorySnapshot(context.Background(), instance, token, owner, name)
 	}
 	if err != nil {
+		pending, requestErr := createDeviceAccessRequest(context.Background(), instance, token, owner, name)
+		if requestErr == nil {
+			return nil, "", deviceAccessPendingError{Code: pending.Code}
+		}
 		return nil, "", err
 	}
 	rek, err := cryptokit.UnwrapREK(identity.Identity, snapshot.WrappedREK)
@@ -951,6 +972,124 @@ func runRepo(args []string, out, errOut io.Writer) int {
 	return 0
 }
 
+func runDevices(args []string, out, errOut io.Writer) int {
+	command := "list"
+	if len(args) > 0 && (args[0] == "approve" || args[0] == "revoke") {
+		command, args = args[0], args[1:]
+	}
+	flags := flag.NewFlagSet("devices "+command, flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
+	instanceFlag := flags.String("instance", "", "local.env instance URL")
+	credentialFile := flags.String("credential-file", "", "explicit 0600 headless credential fallback")
+	if err := flags.Parse(args); err != nil || (command == "list" && flags.NArg() != 0) || ((command == "approve" || command == "revoke") && flags.NArg() != 1) {
+		fmt.Fprintln(errOut, "Usage: localenv devices [approve CODE|revoke DEVICE-ID] [--repo owner/name] [--instance instance-url] [--credential-file path]")
+		return 2
+	}
+	secrets, err := credentialStore(*credentialFile)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: credential storage is unavailable")
+		return 1
+	}
+	instance, token, err := currentSession(secrets, *instanceFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: not signed in; run localenv login <instance-url>")
+		return 1
+	}
+	identity, err := loadIdentity(secrets, instance)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: this machine has no registered device identity; run localenv login again")
+		return 1
+	}
+	owner, name, err := selectedRepository(*repositoryFlag)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: repository was not detected; pass --repo owner/name")
+		return 1
+	}
+	switch command {
+	case "list":
+		devices, err := fetchRepositoryDevices(context.Background(), instance, token, owner, name)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: repository devices are unavailable")
+			return 1
+		}
+		requests, err := fetchPendingDeviceAccessRequests(context.Background(), instance, token, owner, name)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: pending device access requests are unavailable")
+			return 1
+		}
+		for _, device := range devices {
+			access := "pending"
+			if device.HasKey {
+				access = "approved"
+			}
+			fmt.Fprintf(out, "%s  %s  %s  %s  %s\n", device.ID, access, device.GitHubLogin, device.Name, device.Fingerprint)
+		}
+		for _, request := range requests {
+			fmt.Fprintf(out, "pending request  %s  %s  %s  %s\n", request.GitHubLogin, request.DeviceName, request.Fingerprint, request.ID)
+		}
+		return 0
+	case "approve":
+		code := flags.Arg(0)
+		request, err := inspectDeviceAccessRequest(context.Background(), instance, token, owner, name, code)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: device access request was not found")
+			return 1
+		}
+		fmt.Fprintf(out, "Approve device access?\nGitHub user: %s\nRepository: %s/%s\nNew device: %s\nPublic-key fingerprint: %s\nRequest code: %s\n", request.GitHubLogin, owner, name, request.DeviceName, request.Fingerprint, code)
+		if !confirm(out) {
+			fmt.Fprintln(out, "Device access approval cancelled.")
+			return 1
+		}
+		snapshot, err := fetchRepositorySnapshot(context.Background(), instance, token, owner, name)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not retrieve this device's wrapped repository key")
+			return 1
+		}
+		rek, err := cryptokit.UnwrapREK(identity.Identity, snapshot.WrappedREK)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not unwrap this repository's encryption key")
+			return 1
+		}
+		defer clear(rek)
+		wrapped, err := cryptokit.WrapREK(rek, request.PublicRecipient)
+		if err != nil {
+			fmt.Fprintln(errOut, "localenv: could not wrap the repository encryption key for the new device")
+			return 1
+		}
+		if err := approveDeviceAccess(context.Background(), instance, token, owner, name, code, wrapped); err != nil {
+			fmt.Fprintln(errOut, "localenv: device access approval was rejected")
+			return 1
+		}
+		fmt.Fprintln(out, "Device access approved. The new device can now sync.")
+		return 0
+	case "revoke":
+		deviceID := flags.Arg(0)
+		fmt.Fprintf(out, "Revoke device %s? This stops future snapshots and removes its wrapped repository keys. [y/N] ", deviceID)
+		if !confirmResponse() {
+			fmt.Fprintln(out, "Device revocation cancelled.")
+			return 1
+		}
+		if err := revokeRepositoryDevice(context.Background(), instance, token, owner, name, deviceID); err != nil {
+			fmt.Fprintln(errOut, "localenv: device revocation was rejected")
+			return 1
+		}
+		fmt.Fprintln(out, "Device revoked. Rotate the repository key to cryptographically protect future ciphertext from a retained old key.")
+		return 0
+	}
+	return 2
+}
+
+func confirm(out io.Writer) bool {
+	fmt.Fprint(out, "Continue? [y/N] ")
+	return confirmResponse()
+}
+
+func confirmResponse() bool {
+	answer, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	return err == nil && strings.EqualFold(strings.TrimSpace(answer), "y")
+}
+
 func currentSession(secrets secretStore, instanceFlag string) (string, string, error) {
 	instanceRaw := instanceFlag
 	var err error
@@ -1212,6 +1351,24 @@ type apiRepositorySnapshot struct {
 	Secrets    []apiSecretSnapshot      `json:"secrets"`
 }
 
+type apiDeviceAccessRequest struct {
+	ID              string `json:"id"`
+	GitHubLogin     string `json:"github_login"`
+	DeviceID        string `json:"device_id"`
+	DeviceName      string `json:"device_name"`
+	PublicRecipient string `json:"public_recipient"`
+	Fingerprint     string `json:"fingerprint"`
+	Code            string `json:"code"`
+}
+
+type apiRepositoryDevice struct {
+	ID          string `json:"id"`
+	GitHubLogin string `json:"github_login"`
+	Name        string `json:"name"`
+	Fingerprint string `json:"fingerprint"`
+	HasKey      bool   `json:"has_key"`
+}
+
 func exchange(ctx context.Context, instance, code string) (apiSession, error) {
 	var out apiSession
 	return out, requestJSON(ctx, http.MethodPost, instance+"/api/v1/auth/exchange", "", map[string]string{"code": code}, &out)
@@ -1237,6 +1394,37 @@ func fetchRepositorySnapshot(ctx context.Context, instance, token, owner, name s
 	var result apiRepositorySnapshot
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/snapshot", instance, url.PathEscape(owner), url.PathEscape(name))
 	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
+}
+func createDeviceAccessRequest(ctx context.Context, instance, token, owner, name string) (apiDeviceAccessRequest, error) {
+	var result apiDeviceAccessRequest
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/device-access-requests", instance, url.PathEscape(owner), url.PathEscape(name))
+	return result, requestJSON(ctx, http.MethodPost, endpoint, token, map[string]string{}, &result)
+}
+func fetchPendingDeviceAccessRequests(ctx context.Context, instance, token, owner, name string) ([]apiDeviceAccessRequest, error) {
+	var result []apiDeviceAccessRequest
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/device-access-requests", instance, url.PathEscape(owner), url.PathEscape(name))
+	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
+}
+func inspectDeviceAccessRequest(ctx context.Context, instance, token, owner, name, code string) (apiDeviceAccessRequest, error) {
+	var result apiDeviceAccessRequest
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/device-access-requests/inspect", instance, url.PathEscape(owner), url.PathEscape(name))
+	return result, requestJSON(ctx, http.MethodPost, endpoint, token, map[string]string{"code": code}, &result)
+}
+func approveDeviceAccess(ctx context.Context, instance, token, owner, name, code string, wrappedREK []byte) error {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/device-access-requests/approve", instance, url.PathEscape(owner), url.PathEscape(name))
+	return requestJSON(ctx, http.MethodPost, endpoint, token, struct {
+		Code       string `json:"code"`
+		WrappedREK []byte `json:"wrapped_rek"`
+	}{code, wrappedREK}, nil)
+}
+func fetchRepositoryDevices(ctx context.Context, instance, token, owner, name string) ([]apiRepositoryDevice, error) {
+	var result []apiRepositoryDevice
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/devices", instance, url.PathEscape(owner), url.PathEscape(name))
+	return result, requestJSON(ctx, http.MethodGet, endpoint, token, nil, &result)
+}
+func revokeRepositoryDevice(ctx context.Context, instance, token, owner, name, deviceID string) error {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/devices/%s", instance, url.PathEscape(owner), url.PathEscape(name), url.PathEscape(deviceID))
+	return requestJSON(ctx, http.MethodDelete, endpoint, token, nil, nil)
 }
 func fetchCurrentPullRequest(ctx context.Context, instance, token, owner, name, branch string) (int, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/current?branch=%s", instance, url.PathEscape(owner), url.PathEscape(name), url.QueryEscape(branch))
