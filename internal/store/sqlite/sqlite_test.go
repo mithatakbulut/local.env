@@ -620,7 +620,8 @@ func TestDeviceAccessApprovalRewrapsLocallyAndRevocationStopsSnapshots(t *testin
 }
 
 func TestEncryptedPullSecretUpdatePromotesOrDiscardsWithoutPlaintext(t *testing.T) {
-	store, err := Open(context.Background(), t.TempDir())
+	dataDir := t.TempDir()
+	store, err := Open(context.Background(), dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,6 +668,7 @@ func TestEncryptedPullSecretUpdatePromotesOrDiscardsWithoutPlaintext(t *testing.
 	if err := store.UpdateBaselineSecret(ctx, "acme", "api", user.ID, device.ID, fileID, "DATABASE_URL", 0, SecretEnvelope(baseline)); err != nil {
 		t.Fatal(err)
 	}
+	assertDatabaseArtifactsExclude(t, dataDir, []byte("baseline-non-secret-sentinel"), rek)
 	snapshot, err := store.RepositorySnapshotForDevice(ctx, "acme", "api", user.ID, device.ID)
 	if err != nil || len(snapshot.Secrets) != 1 || snapshot.Secrets[0].KeyName != "DATABASE_URL" || strings.Contains(string(snapshot.Secrets[0].Envelope.Ciphertext), "baseline-non-secret-sentinel") {
 		t.Fatalf("baseline snapshot = %#v, %v", snapshot, err)
@@ -710,6 +712,7 @@ func TestEncryptedPullSecretUpdatePromotesOrDiscardsWithoutPlaintext(t *testing.
 	if _, err := store.UpdatePullRequestSecret(ctx, "acme", "api", 101, user.ID, device.ID, fileID, "SECOND_KEY", 0, SecretEnvelope(envelope)); err != nil {
 		t.Fatal(err)
 	}
+	assertDatabaseArtifactsExclude(t, dataDir, []byte("non-secret-test-value"), []byte("another-non-secret-sentinel"), rek)
 	pull.State = "closed"
 	if err := store.ClosePullRequest(ctx, pull); err != nil {
 		t.Fatal(err)
@@ -717,5 +720,30 @@ func TestEncryptedPullSecretUpdatePromotesOrDiscardsWithoutPlaintext(t *testing.
 	var archivedAt any
 	if err := store.db.QueryRow(`SELECT archived_at FROM secret_versions WHERE repository_id = 'github:17' AND scope_id = '101'`).Scan(&archivedAt); err != nil || archivedAt == nil {
 		t.Fatalf("discarded pending ciphertext archived_at = %v, %v", archivedAt, err)
+	}
+}
+
+// assertDatabaseArtifactsExclude inspects the live SQLite database and its
+// companion files. The inputs are intentionally non-secret sentinels; this
+// proves client plaintext does not reach server persistence, including WAL.
+func assertDatabaseArtifactsExclude(t *testing.T, dataDir string, forbidden ...[]byte) {
+	t.Helper()
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(dataDir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range forbidden {
+			if bytes.Contains(contents, value) {
+				t.Fatalf("database artifact %q persisted a client plaintext sentinel", entry.Name())
+			}
+		}
 	}
 }

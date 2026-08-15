@@ -181,6 +181,34 @@ func TestSecondDeveloperSyncDecryptsMergedSnapshotWithoutChangingLocalContent(t 
 	}
 }
 
+func TestSyncRejectsTamperedCiphertextWithoutChangingTarget(t *testing.T) {
+	root, server, credentials := runtimeTestRepositoryWithEnvelope(t, func(envelope *cryptokit.Envelope) {
+		envelope.Ciphertext[0] ^= 1
+	})
+	defer server.Close()
+	target := filepath.Join(root, ".env.local")
+	initial := []byte("LOCAL_ONLY=true\n")
+	if err := os.WriteFile(target, initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+
+	if _, _, err := syncSnapshot("", server.URL, credentials.path, 0); err == nil {
+		t.Fatal("sync accepted tampered ciphertext")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, initial) {
+		t.Fatalf("tampered sync changed target: content %q, err %v", got, err)
+	}
+}
+
 func TestDeviceIdentityUsesDeviceRegistrationPayloadNames(t *testing.T) {
 	encoded, err := json.Marshal(deviceIdentity{
 		ID:          "device-test-id",
@@ -369,6 +397,10 @@ func TestDoctorChecksRuntimePrerequisites(t *testing.T) {
 }
 
 func runtimeTestRepository(t *testing.T) (string, *httptest.Server, *fileStore) {
+	return runtimeTestRepositoryWithEnvelope(t, nil)
+}
+
+func runtimeTestRepositoryWithEnvelope(t *testing.T, mutateEnvelope func(*cryptokit.Envelope)) (string, *httptest.Server, *fileStore) {
 	t.Helper()
 	root := t.TempDir()
 	if output, err := exec.Command("git", "init", "-q", root).CombinedOutput(); err != nil {
@@ -399,6 +431,9 @@ func runtimeTestRepository(t *testing.T) (string, *httptest.Server, *fileStore) 
 	envelope, err := cryptokit.Encrypt(rek, []byte("runtime-test-sentinel"), cryptokit.AAD{InstanceID: "edb7f4f6-4bc5-4eca-91cd-bfde8588e2a9", GitHubRepoID: 17, FilePath: ".env.local", KeyName: "DATABASE_URL", Scope: "baseline", Version: 1, KeyEpoch: 1})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if mutateEnvelope != nil {
+		mutateEnvelope(&envelope)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
