@@ -650,7 +650,7 @@ func Manifest(name, publicURL string) ([]byte, error) {
 		},
 		DefaultPermissions: map[string]string{
 			"contents":      "read",
-			"pull_requests": "read",
+			"pull_requests": "write",
 			"checks":        "write",
 			"issues":        "write",
 			"metadata":      "read",

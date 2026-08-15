@@ -64,9 +64,13 @@ volume:
 The setup wizard is intentionally unavailable until all three are present.
 After they are configured, visit `/setup`, sign in with GitHub, select the
 organization, create the App, and install it into the repositories to
-discover. The generated App requests only Contents/Pull requests read,
-Checks/Issues write, and Metadata read; it never requests source-code write,
-Actions, Administration, or Secrets permissions.
+discover. The generated App requests Contents read, Pull requests/Checks/Issues
+write, and Metadata read. `Pull requests: write` is a temporary,
+selected-repository exception for sticky PR comments while
+[`github/rest-api-description#6994`](https://github.com/github/rest-api-description/issues/6994)
+is resolved; it must be reconsidered before a future permission or release
+decision. The App never requests Contents write, Actions, Administration, or
+Secrets permissions.
 
 `/healthz` confirms that the process is alive. `/readyz` confirms SQLite is
 readable, every compiled migration is applied, and the encrypted GitHub App

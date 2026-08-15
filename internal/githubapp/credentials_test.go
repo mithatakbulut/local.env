@@ -65,7 +65,7 @@ func TestManifestRequestsOnlyRequiredPermissionsAndEvents(t *testing.T) {
 			t.Errorf("manifest requests forbidden permission %s", forbidden)
 		}
 	}
-	for _, required := range []string{`"contents":"read"`, `"pull_requests":"read"`, `"checks":"write"`, `"issues":"write"`, `"pull_request"`} {
+	for _, required := range []string{`"contents":"read"`, `"pull_requests":"write"`, `"checks":"write"`, `"issues":"write"`, `"pull_request"`} {
 		if !bytes.Contains(manifest, []byte(required)) {
 			t.Errorf("manifest is missing %s", required)
 		}
