@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -198,6 +199,14 @@ func TestDeviceIdentityUsesDeviceRegistrationPayloadNames(t *testing.T) {
 	}
 	if _, found := payload["Recipient"]; found {
 		t.Fatalf("device registration payload used Go field name: %#v", payload)
+	}
+}
+
+func TestNormalizeImportArgsAcceptsDocumentedFileFirstSyntax(t *testing.T) {
+	got := normalizeImportArgs([]string{".env.local", "--instance", "https://env.example.test", "--repo", "acme/api"})
+	want := []string{"--instance", "https://env.example.test", "--repo", "acme/api", ".env.local"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized arguments = %#v, want %#v", got, want)
 	}
 }
 

@@ -661,6 +661,7 @@ func clearSnapshot(snapshot decryptedSnapshot) {
 }
 
 func runImport(args []string, out, errOut io.Writer) int {
+	args = normalizeImportArgs(args)
 	flags := flag.NewFlagSet("import", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	repositoryFlag := flags.String("repo", "", "GitHub repository as owner/name")
@@ -768,6 +769,16 @@ func runImport(args []string, out, errOut io.Writer) int {
 	}
 	fmt.Fprintf(out, "Encrypted and imported %d declared local value(s).\n", count)
 	return 0
+}
+
+// normalizeImportArgs preserves the documented `localenv import FILE
+// [flags]` spelling while also accepting the standard Go flag spelling with
+// FILE last. The flag package stops parsing at the first positional argument.
+func normalizeImportArgs(args []string) []string {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return args
+	}
+	return append(append([]string{}, args[1:]...), args[0])
 }
 
 func confirmReplace(out io.Writer) bool {
