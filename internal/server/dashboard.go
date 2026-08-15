@@ -163,7 +163,10 @@ func (s *Server) dashboardSettings(w http.ResponseWriter, r *http.Request) {
 	s.renderDashboard(w, r, dashboardPage{Title: "Settings", User: session.User.Login, PublicURL: s.config.PublicURL.String(), DisplayName: s.config.DisplayName})
 }
 
-type dashboardMetadata struct{ Key, Value string }
+type dashboardMetadata struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 type dashboardAuditEvent struct {
 	sqlite.AuditEvent
 	Metadata []dashboardMetadata
