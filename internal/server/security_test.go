@@ -136,8 +136,8 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 	callback.AddCookie(cookieNamed(t, start.Result().Cookies(), oauthStateCookie))
 	response := httptest.NewRecorder()
 	app.Handler().ServeHTTP(response, callback)
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("non-member dashboard callback = %d", response.Code)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "outsider") || strings.Contains(response.Body.String(), "oauth-token") {
+		t.Fatalf("non-member dashboard callback = %d %q", response.Code, response.Body.String())
 	}
 }
 

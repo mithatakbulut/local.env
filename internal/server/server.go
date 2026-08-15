@@ -649,7 +649,7 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !memberOfOrganization(organizations, organization.ID) {
-			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
+			http.Error(w, "GitHub account "+user.Login+" does not have an active membership in the configured organization", http.StatusForbidden)
 			return
 		}
 		session := dashboardSession{User: user, OrganizationID: organization.ID, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
