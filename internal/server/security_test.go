@@ -170,7 +170,7 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 	const browserSentinel = "D5-NON-SECRET-BROWSER-SENTINEL"
 	var logs bytes.Buffer
 	app := NewWithGitHubClientAndLogger(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), DisplayName: "Acme Local Env", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.DefaultClient(), slog.New(slog.NewTextHandler(&logs, nil)))
-	for _, requestPath := range []string{"/repos", "/repos/acme/api", "/repos/acme/api/pulls/12", "/devices", "/audit", "/settings"} {
+	for _, requestPath := range []string{"/repos", "/repos/acme/api", "/repos/acme/api/pulls/12", "/devices", "/audit", "/api/v1/dashboard/audit", "/settings"} {
 		unauthenticated := httptest.NewRecorder()
 		app.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, requestPath, nil))
 		if unauthenticated.Code != http.StatusFound || unauthenticated.Header().Get("Location") != "/login" {
@@ -205,6 +205,13 @@ func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *
 		if page.Code != http.StatusOK || !strings.Contains(pageBody, pageCase.kind) || strings.Contains(pageBody, browserSentinel) || strings.Contains(pageBody, "ciphertext") || strings.Contains(pageBody, "wrapped_rek") || strings.Contains(pageBody, "secret_value") {
 			t.Fatalf("dashboard page %q = %d %q", pageCase.path, page.Code, body)
 		}
+	}
+	auditRequest := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/audit", nil)
+	auditRequest.AddCookie(cookie)
+	auditResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(auditResponse, auditRequest)
+	if auditResponse.Code != http.StatusOK || !strings.Contains(auditResponse.Body.String(), `"events"`) || strings.Contains(auditResponse.Body.String(), browserSentinel) || strings.Contains(auditResponse.Body.String(), "ciphertext") || auditResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("dashboard audit page = %d %q", auditResponse.Code, auditResponse.Body.String())
 	}
 
 	// The sentinel stands in for sensitive browser input. It is intentionally

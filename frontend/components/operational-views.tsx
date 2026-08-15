@@ -1,9 +1,10 @@
-import { useState, type ReactNode } from "react";
+import { formatDistanceToNowStrict } from "date-fns";
+import InfiniteScroll from "react-infinite-scroll-component";
+import { useCallback, useState, type ReactNode } from "react";
 import {
   CheckCircle2,
   CircleAlert,
   CircleMinus,
-  Clock3,
   ExternalLink,
   Github,
   History,
@@ -14,7 +15,7 @@ import {
   Terminal,
 } from "lucide-react";
 
-import type { DashboardAuditEvent, DashboardBootstrap, DashboardDevice, DashboardSetup } from "@/components/dashboard-shell";
+import type { DashboardAuditEvent, DashboardAuditPage, DashboardBootstrap, DashboardDevice, DashboardSetup } from "@/components/dashboard-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -26,6 +27,14 @@ function PageHeading({ eyebrow, title, children }: { eyebrow: string; title: str
 function timestamp(value: string) {
   const parsed = new Date(value);
   return Number.isNaN(parsed.valueOf()) ? "—" : parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+function relativeTimestamp(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) return "—";
+  return formatDistanceToNowStrict(parsed, { addSuffix: true })
+    .replace(/^1 minute\b/, "1 min")
+    .replace(/^(\d+) minutes\b/, "$1 mins");
 }
 
 function DeviceState({ device }: { device: DashboardDevice }) {
@@ -49,11 +58,39 @@ function Metadata({ event }: { event: DashboardAuditEvent }) {
   return <div className="flex flex-wrap gap-1.5">{event.metadata.map(({ key, value }) => <span key={`${key}:${value}`} className="rounded-md bg-muted px-2 py-1 font-mono text-xs"><span className="text-muted-foreground">{key}=</span>{value}</span>)}</div>;
 }
 
-function AuditPage({ events }: { events: DashboardAuditEvent[] }) {
+function isAuditPage(value: unknown): value is DashboardAuditPage {
+  if (!value || typeof value !== "object") return false;
+  const page = value as Partial<DashboardAuditPage>;
+  return Array.isArray(page.events) && page.events.every((event) => Boolean(event) && typeof event === "object" && typeof (event as DashboardAuditEvent).event_type === "string" && typeof (event as DashboardAuditEvent).actor_device_id === "string" && typeof (event as DashboardAuditEvent).created_at === "string" && Array.isArray((event as DashboardAuditEvent).metadata) && (event as DashboardAuditEvent).metadata.every((metadata) => Boolean(metadata) && typeof metadata === "object" && typeof metadata.key === "string" && typeof metadata.value === "string")) && (page.next_cursor === undefined || typeof page.next_cursor === "string");
+}
+
+function AuditPage({ initialEvents, initialNextCursor }: { initialEvents: DashboardAuditEvent[]; initialNextCursor?: string }) {
+  const [events, setEvents] = useState(initialEvents);
+  const [nextCursor, setNextCursor] = useState(initialNextCursor);
+  const [canLoadMore, setCanLoadMore] = useState(Boolean(initialNextCursor));
+  const [loadError, setLoadError] = useState(false);
+
+  const loadMore = useCallback(async () => {
+    if (!nextCursor) return;
+    try {
+      setLoadError(false);
+      const response = await fetch(`/api/v1/dashboard/audit?cursor=${encodeURIComponent(nextCursor)}`, { credentials: "same-origin", headers: { Accept: "application/json" } });
+      const page: unknown = await response.json();
+      if (!response.ok || !isAuditPage(page)) throw new Error("audit page unavailable");
+      setEvents((current) => [...current, ...page.events]);
+      setNextCursor(page.next_cursor);
+      setCanLoadMore(Boolean(page.next_cursor));
+    } catch {
+      setLoadError(true);
+      setCanLoadMore(false);
+    }
+  }, [nextCursor]);
+
   return <>
-    <PageHeading eyebrow="Metadata-only event trail" title="Audit"><Badge><History aria-hidden="true" className="h-3.5 w-3.5" />Latest {events.length} events</Badge></PageHeading>
+    <PageHeading eyebrow="Metadata-only event trail" title="Audit"><Badge><History aria-hidden="true" className="h-3.5 w-3.5" />{events.length} loaded</Badge></PageHeading>
     <Card className="overflow-hidden">
-      {events.length === 0 ? <div className="p-8 text-center sm:p-12"><History aria-hidden="true" className="mx-auto h-8 w-8 text-muted-foreground" /><h2 className="mt-4 text-lg font-semibold">No audit events yet</h2><p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Repository setup, device access, and encrypted-update metadata will appear here. Secret values never do.</p></div> : <div className="overflow-x-auto"><table className="w-full min-w-[52rem] text-left text-sm"><thead className="bg-muted text-xs uppercase tracking-wide text-muted-foreground"><tr><th className="px-5 py-3 font-medium">Time</th><th className="px-5 py-3 font-medium">Event</th><th className="px-5 py-3 font-medium">Actor device</th><th className="px-5 py-3 font-medium">Metadata</th></tr></thead><tbody className="divide-y divide-border">{events.map((event, index) => <tr key={`${event.created_at}:${event.event_type}:${index}`}><td className="whitespace-nowrap px-5 py-4 text-xs text-muted-foreground">{timestamp(event.created_at)}</td><td className="px-5 py-4 font-mono text-xs font-medium">{event.event_type}</td><td className="px-5 py-4 font-mono text-xs text-muted-foreground">{event.actor_device_id || "System"}</td><td className="px-5 py-4"><Metadata event={event} /></td></tr>)}</tbody></table></div>}
+      {events.length === 0 ? <div className="p-8 text-center sm:p-12"><History aria-hidden="true" className="mx-auto h-8 w-8 text-muted-foreground" /><h2 className="mt-4 text-lg font-semibold">No audit events yet</h2><p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Repository setup, device access, and encrypted-update metadata will appear here. Secret values never do.</p></div> : <InfiniteScroll dataLength={events.length} next={() => { void loadMore(); }} hasMore={canLoadMore} loader={<p className="px-5 py-4 text-center text-sm text-muted-foreground">Loading older events…</p>} endMessage={<p className="px-5 py-4 text-center text-sm text-muted-foreground">You’ve reached the start of the audit trail.</p>} scrollThreshold="200px"><div className="overflow-x-auto"><table className="w-full min-w-[52rem] text-left text-sm"><thead className="bg-muted text-xs uppercase tracking-wide text-muted-foreground"><tr><th className="px-5 py-3 font-medium">Time</th><th className="px-5 py-3 font-medium">Event</th><th className="px-5 py-3 font-medium">Actor device</th><th className="px-5 py-3 font-medium">Metadata</th></tr></thead><tbody className="divide-y divide-border">{events.map((event, index) => <tr key={`${event.created_at}:${event.event_type}:${index}`}><td className="whitespace-nowrap px-5 py-4 text-xs text-muted-foreground"><time dateTime={event.created_at} title={timestamp(event.created_at)}>{relativeTimestamp(event.created_at)}</time></td><td className="px-5 py-4 font-mono text-xs font-medium">{event.event_type}</td><td className="px-5 py-4 font-mono text-xs text-muted-foreground">{event.actor_device_id || "System"}</td><td className="px-5 py-4"><Metadata event={event} /></td></tr>)}</tbody></table></div></InfiniteScroll>}
+      {loadError && <div className="flex items-center justify-center gap-3 border-t border-border px-5 py-4"><p className="text-sm text-warning">Older events could not be loaded.</p><Button variant="secondary" onClick={() => { setCanLoadMore(Boolean(nextCursor)); void loadMore(); }}>Retry</Button></div>}
     </Card>
   </>;
 }
@@ -78,7 +115,7 @@ function SetupPage({ setup }: { setup: DashboardSetup }) {
 
 export function OperationalViews({ page }: { page: DashboardBootstrap }) {
   if (page.view.kind === "devices") return <DevicesPage devices={page.view.devices} />;
-  if (page.view.kind === "audit") return <AuditPage events={page.view.audit_events} />;
+  if (page.view.kind === "audit") return <AuditPage initialEvents={page.view.audit_events} initialNextCursor={page.view.audit_next_cursor} />;
   if (page.view.kind === "settings") return <SettingsPage page={page} />;
   if (page.view.kind === "setup" && page.view.setup) return <SetupPage setup={page.view.setup} />;
   return null;

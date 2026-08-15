@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -16,13 +17,15 @@ import (
 
 const dashboardCookie = "localenv_dashboard"
 
+const dashboardAuditPageSize = 20
+
 type dashboardStore interface {
 	DashboardOrganization(context.Context) (githubapp.Organization, error)
 	DashboardRepositories(context.Context) ([]sqlite.DashboardRepository, error)
 	DashboardRepository(context.Context, string, string) (sqlite.DashboardRepository, error)
 	DashboardPullRequest(context.Context, string, string, int) (sqlite.DashboardPullRequest, error)
 	DashboardDevices(context.Context) ([]sqlite.DashboardDevice, error)
-	DashboardAuditEvents(context.Context, int) ([]sqlite.AuditEvent, error)
+	DashboardAuditEvents(context.Context, *sqlite.AuditCursor, int) (sqlite.AuditEventPage, error)
 }
 
 type dashboardSession struct {
@@ -138,11 +141,37 @@ func (s *Server) dashboardAudit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, err := store.DashboardAuditEvents(r.Context(), 100)
+	page, err := store.DashboardAuditEvents(r.Context(), nil, dashboardAuditPageSize)
 	if err != nil {
 		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	s.renderDashboard(w, r, dashboardPage{Title: "Audit", User: session.User.Login, AuditList: true, AuditEvents: dashboardAuditEventsFor(page.Events), AuditNextCursor: encodeDashboardAuditCursor(page.NextCursor)})
+}
+
+// dashboardAuditPage returns the next cursor-paginated, metadata-only page
+// for the infinite-scroll audit view. It uses the same dashboard session and
+// organization validation as the HTML route.
+func (s *Server) dashboardAuditPage(w http.ResponseWriter, r *http.Request) {
+	store, _, ok := s.requireDashboard(w, r)
+	if !ok {
+		return
+	}
+	cursor, err := decodeDashboardAuditCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		http.Error(w, "invalid audit cursor", http.StatusBadRequest)
+		return
+	}
+	page, err := store.DashboardAuditEvents(r.Context(), cursor, dashboardAuditPageSize)
+	if err != nil {
+		http.Error(w, "dashboard data is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, dashboardAuditPageView{Events: dashboardAuditEventViewsFor(page.Events), NextCursor: encodeDashboardAuditCursor(page.NextCursor)})
+}
+
+func dashboardAuditEventsFor(events []sqlite.AuditEvent) []dashboardAuditEvent {
 	view := make([]dashboardAuditEvent, 0, len(events))
 	for _, event := range events {
 		metadata := make([]dashboardMetadata, 0, len(event.Metadata))
@@ -152,7 +181,42 @@ func (s *Server) dashboardAudit(w http.ResponseWriter, r *http.Request) {
 		sort.Slice(metadata, func(i, j int) bool { return metadata[i].Key < metadata[j].Key })
 		view = append(view, dashboardAuditEvent{AuditEvent: event, Metadata: metadata})
 	}
-	s.renderDashboard(w, r, dashboardPage{Title: "Audit", User: session.User.Login, AuditList: true, AuditEvents: view})
+	return view
+}
+
+func dashboardAuditEventViewsFor(events []sqlite.AuditEvent) []dashboardAuditEventView {
+	internal := dashboardAuditEventsFor(events)
+	view := make([]dashboardAuditEventView, 0, len(internal))
+	for _, event := range internal {
+		view = append(view, dashboardAuditEventViewFor(event))
+	}
+	return view
+}
+
+func encodeDashboardAuditCursor(cursor *sqlite.AuditCursor) string {
+	if cursor == nil || cursor.CreatedAt.IsZero() || cursor.ID == "" {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(cursor.CreatedAt.UTC().Format(time.RFC3339Nano) + "\n" + cursor.ID))
+}
+
+func decodeDashboardAuditCursor(encoded string) (*sqlite.AuditCursor, error) {
+	if encoded == "" {
+		return nil, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(string(raw), "\n")
+	if len(parts) != 2 || len(parts[1]) == 0 || len(parts[1]) > 128 {
+		return nil, fmt.Errorf("malformed audit cursor")
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return nil, err
+	}
+	return &sqlite.AuditCursor{CreatedAt: createdAt, ID: parts[1]}, nil
 }
 
 func (s *Server) dashboardSettings(w http.ResponseWriter, r *http.Request) {
@@ -172,25 +236,26 @@ type dashboardAuditEvent struct {
 	Metadata []dashboardMetadata
 }
 type dashboardPage struct {
-	Title          string
-	User           string
-	RepositoryList bool
-	Repositories   []sqlite.DashboardRepository
-	Repository     *sqlite.DashboardRepository
-	PullRequest    *sqlite.DashboardPullRequest
-	DeviceList     bool
-	Devices        []sqlite.DashboardDevice
-	AuditList      bool
-	AuditEvents    []dashboardAuditEvent
-	Owner          string
-	Repo           string
-	PublicURL      string
-	DisplayName    string
-	FaviconURL     string
-	Bootstrap      string
-	Stylesheet     string
-	Script         string
-	ReactView      bool
+	Title           string
+	User            string
+	RepositoryList  bool
+	Repositories    []sqlite.DashboardRepository
+	Repository      *sqlite.DashboardRepository
+	PullRequest     *sqlite.DashboardPullRequest
+	DeviceList      bool
+	Devices         []sqlite.DashboardDevice
+	AuditList       bool
+	AuditEvents     []dashboardAuditEvent
+	AuditNextCursor string
+	Owner           string
+	Repo            string
+	PublicURL       string
+	DisplayName     string
+	FaviconURL      string
+	Bootstrap       string
+	Stylesheet      string
+	Script          string
+	ReactView       bool
 }
 
 type dashboardBootstrap struct {
@@ -206,16 +271,17 @@ type dashboardBootstrap struct {
 // public repository metadata and readiness state; secret records, ciphertext,
 // wrapped keys, sessions, and plaintext are intentionally not representable.
 type dashboardView struct {
-	Kind         string                    `json:"kind"`
-	Repositories []dashboardRepositoryView `json:"repositories"`
-	Repository   *dashboardRepositoryView  `json:"repository,omitempty"`
-	PullRequest  *dashboardPullRequestView `json:"pull_request,omitempty"`
-	Devices      []dashboardDeviceView     `json:"devices"`
-	AuditEvents  []dashboardAuditEventView `json:"audit_events"`
-	Settings     *dashboardSettingsView    `json:"settings,omitempty"`
-	Setup        *dashboardSetupView       `json:"setup,omitempty"`
-	Owner        string                    `json:"owner,omitempty"`
-	Repo         string                    `json:"repo,omitempty"`
+	Kind            string                    `json:"kind"`
+	Repositories    []dashboardRepositoryView `json:"repositories"`
+	Repository      *dashboardRepositoryView  `json:"repository,omitempty"`
+	PullRequest     *dashboardPullRequestView `json:"pull_request,omitempty"`
+	Devices         []dashboardDeviceView     `json:"devices"`
+	AuditEvents     []dashboardAuditEventView `json:"audit_events"`
+	AuditNextCursor string                    `json:"audit_next_cursor,omitempty"`
+	Settings        *dashboardSettingsView    `json:"settings,omitempty"`
+	Setup           *dashboardSetupView       `json:"setup,omitempty"`
+	Owner           string                    `json:"owner,omitempty"`
+	Repo            string                    `json:"repo,omitempty"`
 }
 
 type dashboardRepositoryView struct {
@@ -264,6 +330,11 @@ type dashboardAuditEventView struct {
 	ActorDeviceID string              `json:"actor_device_id"`
 	Metadata      []dashboardMetadata `json:"metadata"`
 	CreatedAt     string              `json:"created_at"`
+}
+
+type dashboardAuditPageView struct {
+	Events     []dashboardAuditEventView `json:"events"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
 }
 
 type dashboardSettingsView struct {
@@ -352,7 +423,7 @@ func dashboardViewForPage(page dashboardPage) dashboardView {
 		}
 		return view
 	case page.AuditList:
-		view := dashboardView{Kind: "audit", AuditEvents: make([]dashboardAuditEventView, 0, len(page.AuditEvents))}
+		view := dashboardView{Kind: "audit", AuditEvents: make([]dashboardAuditEventView, 0, len(page.AuditEvents)), AuditNextCursor: page.AuditNextCursor}
 		for _, event := range page.AuditEvents {
 			view.AuditEvents = append(view.AuditEvents, dashboardAuditEventViewFor(event))
 		}

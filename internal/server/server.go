@@ -144,6 +144,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", s.dashboardPullRequest)
 	mux.HandleFunc("GET /devices", s.dashboardDevices)
 	mux.HandleFunc("GET /audit", s.dashboardAudit)
+	mux.HandleFunc("GET /api/v1/dashboard/audit", s.dashboardAuditPage)
 	mux.HandleFunc("GET /settings", s.dashboardSettings)
 	mux.HandleFunc("POST /setup/github-app", s.createGitHubApp)
 	mux.HandleFunc("GET /setup/github-app/callback", s.githubAppCallback)

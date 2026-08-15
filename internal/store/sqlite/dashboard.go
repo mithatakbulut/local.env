@@ -39,12 +39,27 @@ type DashboardPullRequest struct {
 // AuditEvent contains allowlisted metadata about an action. Audit metadata is
 // never a request body, secret envelope, session, or repository key.
 type AuditEvent struct {
+	ID            string
 	EventType     string
 	ActorUserID   string
 	ActorDeviceID string
 	RepositoryID  string
 	Metadata      map[string]string
 	CreatedAt     time.Time
+}
+
+// AuditCursor identifies a stable position in the globally ordered audit
+// trail. It is encoded only as an opaque dashboard cursor and is never part
+// of the dashboard event DTO.
+type AuditCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// AuditEventPage is one metadata-only page of audit events.
+type AuditEventPage struct {
+	Events     []AuditEvent
+	NextCursor *AuditCursor
 }
 
 // DashboardOrganization identifies the one organization configured for the
@@ -215,27 +230,47 @@ func (s *Store) DashboardDevices(ctx context.Context) ([]DashboardDevice, error)
 	return result, rows.Err()
 }
 
-// DashboardAuditEvents returns a bounded, metadata-only audit trail.
-func (s *Store) DashboardAuditEvents(ctx context.Context, limit int) ([]AuditEvent, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 100
+// DashboardAuditEvents returns one bounded, metadata-only audit page. Cursor
+// pagination avoids loading the full audit trail into the dashboard and keeps
+// the descending created_at/id ordering stable when timestamps are equal.
+func (s *Store) DashboardAuditEvents(ctx context.Context, cursor *AuditCursor, limit int) (AuditEventPage, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 20
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT event_type, COALESCE(actor_user_id, ''), COALESCE(actor_device_id, ''), COALESCE(repository_id, ''), metadata_json, created_at FROM audit_events ORDER BY created_at DESC, id DESC LIMIT ?`, limit)
+	var cursorCreatedAt any
+	var cursorID string
+	if cursor != nil {
+		cursorCreatedAt = cursor.CreatedAt
+		cursorID = cursor.ID
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, event_type, COALESCE(actor_user_id, ''), COALESCE(actor_device_id, ''), COALESCE(repository_id, ''), metadata_json, created_at
+		FROM audit_events
+		WHERE ? IS NULL OR created_at < ? OR (created_at = ? AND id < ?)
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?`, cursorCreatedAt, cursorCreatedAt, cursorCreatedAt, cursorID, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("list dashboard audit events: %w", err)
+		return AuditEventPage{}, fmt.Errorf("list dashboard audit events: %w", err)
 	}
 	defer rows.Close()
-	var result []AuditEvent
+	result := AuditEventPage{Events: make([]AuditEvent, 0, limit)}
 	for rows.Next() {
 		var event AuditEvent
 		var raw string
-		if err := rows.Scan(&event.EventType, &event.ActorUserID, &event.ActorDeviceID, &event.RepositoryID, &raw, &event.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan dashboard audit event: %w", err)
+		if err := rows.Scan(&event.ID, &event.EventType, &event.ActorUserID, &event.ActorDeviceID, &event.RepositoryID, &raw, &event.CreatedAt); err != nil {
+			return AuditEventPage{}, fmt.Errorf("scan dashboard audit event: %w", err)
 		}
 		if err := json.Unmarshal([]byte(raw), &event.Metadata); err != nil {
-			return nil, fmt.Errorf("decode dashboard audit metadata: %w", err)
+			return AuditEventPage{}, fmt.Errorf("decode dashboard audit metadata: %w", err)
 		}
-		result = append(result, event)
+		result.Events = append(result.Events, event)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return AuditEventPage{}, err
+	}
+	if len(result.Events) > limit {
+		result.Events = result.Events[:limit]
+		last := result.Events[len(result.Events)-1]
+		result.NextCursor = &AuditCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return result, nil
 }
