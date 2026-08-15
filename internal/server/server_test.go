@@ -36,7 +36,7 @@ func TestCLIAuthenticationExchangesOneTimeCodeRegistersDeviceAndRevokesSession(t
 			_, _ = w.Write([]byte(`{"access_token":"test-github-access-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":31,"login":"developer"}`))
-		case "/user/orgs":
+		case "/user/memberships/orgs":
 			_, _ = w.Write([]byte(`[]`))
 		default:
 			http.NotFound(w, r)
@@ -501,9 +501,9 @@ func TestSetupFlowStoresOnlyEncryptedGitHubCredentialsAndBecomesReady(t *testing
 		case "/user":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":1,"login":"admin"}`))
-		case "/user/orgs":
+		case "/user/memberships/orgs":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[{"id":2,"login":"acme"}]`))
+			_, _ = w.Write([]byte(`[{"state":"active","organization":{"id":2,"login":"acme"}}]`))
 		case "/app-manifests/manifest-code/conversions":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)

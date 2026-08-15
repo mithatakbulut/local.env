@@ -55,16 +55,6 @@ func TestGitHubPublicationFailureLogsOnlySafeStatusMetadata(t *testing.T) {
 	}
 }
 
-func TestDashboardMembershipFailureLogsOnlySafeStatusMetadata(t *testing.T) {
-	var logs bytes.Buffer
-	app := NewWithGitHubClientAndLogger(config.Config{}, testStore{}, githubapp.DefaultClient(), slog.New(slog.NewTextHandler(&logs, nil)))
-	app.logGitHubDashboardMembershipFailure(&githubapp.HTTPError{Operation: "organization_membership", StatusCode: http.StatusForbidden, PermissionRequirement: "metadata_read"})
-	output := logs.String()
-	if !strings.Contains(output, "github_operation=organization_membership") || !strings.Contains(output, "github_status=403") || !strings.Contains(output, "github_status_class=forbidden") || !strings.Contains(output, "github_permission_requirement=metadata_read") || strings.Contains(output, "error=") {
-		t.Fatalf("dashboard membership log = %q", output)
-	}
-}
-
 func TestDashboardPagesRequireSignedOrganizationSessionAndExposeOnlyMetadata(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), t.TempDir())
 	if err != nil {
@@ -128,10 +118,8 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":11,"login":"outsider"}`))
-		case "/user/orgs":
-			_, _ = w.Write([]byte(`[{"id":8,"login":"other"}]`))
-		case "/user/memberships/orgs/acme":
-			_, _ = w.Write([]byte(`{"state":"pending","organization":{"id":7,"login":"acme"}}`))
+		case "/user/memberships/orgs":
+			_, _ = w.Write([]byte(`[{"state":"pending","organization":{"id":7,"login":"acme"}}]`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -153,7 +141,7 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 	}
 }
 
-func TestDashboardLoginUsesDirectActiveMembership(t *testing.T) {
+func TestDashboardLoginUsesActiveOrganizationMembership(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -168,11 +156,8 @@ func TestDashboardLoginUsesDirectActiveMembership(t *testing.T) {
 			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
 		case "/user":
 			_, _ = w.Write([]byte(`{"id":11,"login":"member"}`))
-		case "/user/orgs":
-			// GitHub's organization listing may omit an otherwise active membership.
-			_, _ = w.Write([]byte(`[{"id":8,"login":"other"}]`))
-		case "/user/memberships/orgs/acme":
-			_, _ = w.Write([]byte(`{"state":"active","organization":{"id":7,"login":"acme"}}`))
+		case "/user/memberships/orgs":
+			_, _ = w.Write([]byte(`[{"state":"active","organization":{"id":7,"login":"acme"}}]`))
 		default:
 			http.NotFound(w, r)
 		}

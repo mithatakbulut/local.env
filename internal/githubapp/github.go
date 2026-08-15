@@ -147,50 +147,20 @@ func (c Client) UserAndOrganizations(ctx context.Context, token string) (User, [
 	if user.ID <= 0 || user.Login == "" {
 		return User{}, nil, errors.New("GitHub user response is incomplete")
 	}
-	var organizations []Organization
-	if err := c.getJSON(ctx, "/user/orgs?per_page=100", token, &organizations); err != nil {
-		return User{}, nil, err
-	}
-	filtered := organizations[:0]
-	for _, organization := range organizations {
-		if organization.ID > 0 && validGitHubLogin(organization.Login) {
-			filtered = append(filtered, organization)
-		}
-	}
-	return user, filtered, nil
-}
-
-// ActiveOrganizationMembership verifies the current OAuth user's active
-// membership in one named organization. Dashboard authorization must use this
-// direct membership endpoint instead of inferring membership from a list of
-// organizations, which can be incomplete under organization access policies.
-func (c Client) ActiveOrganizationMembership(ctx context.Context, token, organizationLogin string) (Organization, error) {
-	if !validGitHubLogin(organizationLogin) {
-		return Organization{}, errors.New("invalid GitHub organization login")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiURL("user", "memberships", "orgs", organizationLogin), nil)
-	if err != nil {
-		return Organization{}, err
-	}
-	response, err := c.authorized(request, token)
-	if err != nil {
-		return Organization{}, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return Organization{}, &HTTPError{Operation: "organization_membership", StatusCode: response.StatusCode, PermissionRequirement: safeAcceptedPermissions(response.Header.Get("X-Accepted-GitHub-Permissions")), ResponseClass: safeResponseClass(response.StatusCode, response.Header)}
-	}
-	var membership struct {
+	var memberships []struct {
 		State        string       `json:"state"`
 		Organization Organization `json:"organization"`
 	}
-	if err := decodeJSON(response.Body, &membership); err != nil {
-		return Organization{}, err
+	if err := c.getJSON(ctx, "/user/memberships/orgs?per_page=100", token, &memberships); err != nil {
+		return User{}, nil, err
 	}
-	if membership.State != "active" || membership.Organization.ID <= 0 || membership.Organization.Login != organizationLogin {
-		return Organization{}, errors.New("GitHub organization membership is not active")
+	organizations := make([]Organization, 0, len(memberships))
+	for _, membership := range memberships {
+		if membership.State == "active" && membership.Organization.ID > 0 && validGitHubLogin(membership.Organization.Login) {
+			organizations = append(organizations, membership.Organization)
+		}
 	}
-	return membership.Organization, nil
+	return user, organizations, nil
 }
 
 type ManifestConversion struct {

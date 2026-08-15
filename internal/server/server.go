@@ -648,9 +648,7 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
 			return
 		}
-		membership, membershipErr := s.github.ActiveOrganizationMembership(ctx, token, organization.Login)
-		if membershipErr != nil || membership.ID != organization.ID {
-			s.logGitHubDashboardMembershipFailure(membershipErr)
+		if !memberOfOrganization(organizations, organization.ID) {
 			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
 			return
 		}
@@ -1307,24 +1305,6 @@ func (s *Server) logGitHubPublicationFailure(err error) {
 	s.logger.Warn("GitHub readiness publication failed", "github_status_class", "transport_or_response")
 }
 
-// logGitHubDashboardMembershipFailure retains only safe GitHub HTTP metadata.
-// OAuth tokens, user data, response bodies, and organization identifiers must
-// never enter logs.
-func (s *Server) logGitHubDashboardMembershipFailure(err error) {
-	var githubError *githubapp.HTTPError
-	if errors.As(err, &githubError) {
-		attributes := []any{"github_operation", githubError.Operation, "github_status", githubError.StatusCode, "github_status_class", githubError.StatusClass()}
-		if githubError.PermissionRequirement != "" {
-			attributes = append(attributes, "github_permission_requirement", githubError.PermissionRequirement)
-		}
-		s.logger.Warn("GitHub dashboard membership check failed", attributes...)
-		return
-	}
-	if err != nil {
-		s.logger.Warn("GitHub dashboard membership check failed", "github_status_class", "transport_or_response")
-	}
-}
-
 func readinessText(requirements []pranalysis.Requirement, detailsURL string) (summary, comment string, success bool) {
 	missing := make([]string, 0)
 	for _, requirement := range requirements {
@@ -1444,6 +1424,15 @@ type oauthState struct {
 }
 
 func (s oauthState) Expired() bool { return time.Now().UTC().After(s.ExpiresAt) }
+
+func memberOfOrganization(organizations []githubapp.Organization, wanted int64) bool {
+	for _, organization := range organizations {
+		if organization.ID == wanted {
+			return true
+		}
+	}
+	return false
+}
 
 type cliOAuthState struct {
 	State       string    `json:"state"`
