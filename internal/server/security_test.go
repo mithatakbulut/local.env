@@ -31,7 +31,7 @@ func TestSecurityMiddlewareSetsHeadersRedactsRequestDataAndLimitsAuthentication(
 	request.Header.Set("Authorization", "Bearer "+sentinel)
 	response := httptest.NewRecorder()
 	app.Handler().ServeHTTP(response, request)
-	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("X-Content-Type-Options") != "nosniff" || response.Header().Get("Strict-Transport-Security") == "" {
+	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("X-Content-Type-Options") != "nosniff" || response.Header().Get("Strict-Transport-Security") == "" || response.Header().Get("Referrer-Policy") != "same-origin" {
 		t.Fatalf("security headers missing: %#v", response.Header())
 	}
 	if output := logs.String(); strings.Contains(output, sentinel) || strings.Contains(output, "body") || !strings.Contains(output, "request_id=") {

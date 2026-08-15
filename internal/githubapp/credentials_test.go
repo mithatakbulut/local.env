@@ -2,6 +2,7 @@ package githubapp
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,9 +65,18 @@ func TestManifestRequestsOnlyRequiredPermissionsAndEvents(t *testing.T) {
 			t.Errorf("manifest requests forbidden permission %s", forbidden)
 		}
 	}
-	for _, required := range []string{`"contents":"read"`, `"pull_requests":"read"`, `"checks":"write"`, `"issues":"write"`, `"pull_request"`, `"installation"`, `"installation_repositories"`} {
+	for _, required := range []string{`"contents":"read"`, `"pull_requests":"read"`, `"checks":"write"`, `"issues":"write"`, `"pull_request"`} {
 		if !bytes.Contains(manifest, []byte(required)) {
 			t.Errorf("manifest is missing %s", required)
 		}
+	}
+	var decoded struct {
+		DefaultEvents []string `json:"default_events"`
+	}
+	if err := json.Unmarshal(manifest, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.DefaultEvents) != 1 || decoded.DefaultEvents[0] != "pull_request" {
+		t.Fatalf("default events = %#v, want only pull_request", decoded.DefaultEvents)
 	}
 }

@@ -558,7 +558,7 @@ func TestSetupFlowStoresOnlyEncryptedGitHubCredentialsAndBecomesReady(t *testing
 	createRequest.AddCookie(setupSessionCookie)
 	create := httptest.NewRecorder()
 	app.Handler().ServeHTTP(create, createRequest)
-	if create.Code != http.StatusOK || !strings.Contains(create.Body.String(), `name="manifest"`) {
+	if create.Code != http.StatusOK || !strings.Contains(create.Body.String(), `name="manifest"`) || !strings.Contains(create.Body.String(), `Continue to GitHub`) || strings.Contains(create.Body.String(), `<script`) {
 		t.Fatalf("create manifest status/body = %d/%q", create.Code, create.Body.String())
 	}
 	manifestCookie := cookieNamed(t, create.Result().Cookies(), setupCookie)

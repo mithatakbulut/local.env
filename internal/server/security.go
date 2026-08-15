@@ -94,7 +94,11 @@ func setSecurityHeaders(w http.ResponseWriter, https bool) {
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://github.com; object-src 'none'; style-src 'self'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// no-referrer makes Chromium emit Origin: null for ordinary HTML form POSTs,
+	// which prevents the same-origin setup form from satisfying CSRF origin
+	// validation. Keep referrers off every cross-origin navigation while allowing
+	// the application to identify its own same-origin form submissions.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 	if https {

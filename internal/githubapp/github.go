@@ -547,7 +547,9 @@ func Manifest(name, publicURL string) ([]byte, error) {
 			"issues":        "write",
 			"metadata":      "read",
 		},
-		DefaultEvents: []string{"pull_request", "installation", "installation_repositories"},
+		// Installation and installation_repositories deliveries are implicit for
+		// GitHub Apps; GitHub rejects them when they are listed in a manifest.
+		DefaultEvents: []string{"pull_request"},
 	})
 }
 
