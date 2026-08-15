@@ -5,12 +5,71 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"filippo.io/age"
 	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/pranalysis"
 	"github.com/localenv/localenv/migrations"
 )
+
+func TestCLIAuthStoresOnlyHashedCodesAndSessionTokens(t *testing.T) {
+	store, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	user := githubapp.User{ID: 41, Login: "developer"}
+	exchangeCode := "non-secret-test-exchange-code"
+	if err := store.CreateAuthExchange(ctx, user, exchangeCode, time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeAuthExchange(ctx, exchangeCode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeAuthExchange(ctx, exchangeCode); err == nil {
+		t.Fatal("exchange code was accepted twice")
+	}
+	sessionToken := "non-secret-test-opaque-session-token"
+	if err := store.CreateSession(ctx, user, sessionToken, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.RegisterDevice(ctx, sessionToken, "device-test-id", "test-device", identity.Recipient().String(), "sha256:0000000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated, err := store.AuthenticateSession(ctx, sessionToken)
+	if err != nil || authenticated.User.Login != user.Login || authenticated.Device.ID != device.ID {
+		t.Fatalf("AuthenticateSession() = %#v, %v", authenticated, err)
+	}
+	var storedTokens string
+	if err := store.db.QueryRow(`SELECT CAST(token_hash AS TEXT) FROM sessions LIMIT 1`).Scan(&storedTokens); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(storedTokens, sessionToken) {
+		t.Fatal("plaintext session token was persisted")
+	}
+	var storedExchanges string
+	if err := store.db.QueryRow(`SELECT CAST(code_hash AS TEXT) FROM auth_exchanges LIMIT 1`).Scan(&storedExchanges); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(storedExchanges, exchangeCode) {
+		t.Fatal("plaintext exchange code was persisted")
+	}
+	if err := store.RevokeSession(ctx, sessionToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthenticateSession(ctx, sessionToken); err == nil {
+		t.Fatal("revoked session authenticated")
+	}
+}
 
 func TestOpenAppliesMigrationsWALAndPermissions(t *testing.T) {
 	dir := t.TempDir()

@@ -3,6 +3,7 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -30,6 +31,202 @@ var ErrRepositoryNotManaged = errors.New("repository is not managed")
 // pragmas (notably foreign_keys) consistently enabled for this small v1 server.
 type Store struct {
 	db *sql.DB
+}
+
+// AuthenticatedSession is the public identity derived from an active opaque
+// session. It deliberately has no token or OAuth credential field.
+type AuthenticatedSession struct {
+	User   githubapp.User
+	Device Device
+}
+
+// Device is public device metadata. Private age identities never enter this
+// package or the server database.
+type Device struct {
+	ID              string    `json:"id"`
+	GitHubUserID    int64     `json:"github_user_id"`
+	Name            string    `json:"name"`
+	PublicRecipient string    `json:"public_recipient"`
+	Fingerprint     string    `json:"fingerprint"`
+	CreatedAt       time.Time `json:"created_at"`
+	LastSeenAt      time.Time `json:"last_seen_at"`
+}
+
+// CreateAuthExchange records a one-time, short-lived CLI exchange code by
+// hash only. code must be random and is never persisted or logged.
+func (s *Store) CreateAuthExchange(ctx context.Context, user githubapp.User, code string, expiresAt time.Time) error {
+	if user.ID <= 0 || strings.TrimSpace(user.Login) == "" || code == "" || expiresAt.Before(time.Now().UTC()) {
+		return errors.New("invalid authentication exchange")
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO github_users(github_user_id, login, created_at, last_seen_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(github_user_id) DO UPDATE SET login = excluded.login, last_seen_at = excluded.last_seen_at`, user.ID, user.Login, now, now)
+	if err != nil {
+		return fmt.Errorf("store GitHub user: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO auth_exchanges(code_hash, github_user_id, expires_at, consumed_at, created_at) VALUES (?, ?, ?, NULL, ?)`, tokenHash(code), user.ID, expiresAt.UTC(), now)
+	if err != nil {
+		return fmt.Errorf("store authentication exchange: %w", err)
+	}
+	return nil
+}
+
+// ConsumeAuthExchange atomically invalidates an exchange code and returns its
+// GitHub user. The plaintext exchange code is compared only through its hash.
+func (s *Store) ConsumeAuthExchange(ctx context.Context, code string) (githubapp.User, error) {
+	if code == "" {
+		return githubapp.User{}, errors.New("authentication exchange code is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return githubapp.User{}, fmt.Errorf("begin authentication exchange: %w", err)
+	}
+	defer tx.Rollback()
+	var user githubapp.User
+	var expiresAt time.Time
+	err = tx.QueryRowContext(ctx, `SELECT u.github_user_id, u.login, e.expires_at FROM auth_exchanges e JOIN github_users u ON u.github_user_id = e.github_user_id WHERE e.code_hash = ? AND e.consumed_at IS NULL`, tokenHash(code)).Scan(&user.ID, &user.Login, &expiresAt)
+	if err != nil || !expiresAt.After(time.Now().UTC()) {
+		return githubapp.User{}, errors.New("authentication exchange is invalid or expired")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE auth_exchanges SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL`, time.Now().UTC(), tokenHash(code))
+	if err != nil {
+		return githubapp.User{}, fmt.Errorf("consume authentication exchange: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return githubapp.User{}, errors.New("authentication exchange is invalid or expired")
+	}
+	if err := tx.Commit(); err != nil {
+		return githubapp.User{}, fmt.Errorf("commit authentication exchange: %w", err)
+	}
+	return user, nil
+}
+
+// CreateSession persists only the SHA-256 hash of an already random 256-bit
+// opaque token. Sessions have no OAuth access-token field.
+func (s *Store) CreateSession(ctx context.Context, user githubapp.User, token string, expiresAt time.Time) error {
+	if user.ID <= 0 || strings.TrimSpace(user.Login) == "" || token == "" || !expiresAt.After(time.Now().UTC()) {
+		return errors.New("invalid session")
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin create session: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO github_users(github_user_id, login, created_at, last_seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(github_user_id) DO UPDATE SET login = excluded.login, last_seen_at = excluded.last_seen_at`, user.ID, user.Login, now, now); err != nil {
+		return fmt.Errorf("store session user: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions(token_hash, github_user_id, device_id, created_at, last_seen_at, expires_at, revoked_at) VALUES (?, ?, NULL, ?, ?, ?, NULL)`, tokenHash(token), user.ID, now, now, expiresAt.UTC()); err != nil {
+		return fmt.Errorf("store session: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit session: %w", err)
+	}
+	return nil
+}
+
+// AuthenticateSession validates a bearer token without returning it.
+func (s *Store) AuthenticateSession(ctx context.Context, token string) (AuthenticatedSession, error) {
+	if token == "" {
+		return AuthenticatedSession{}, errors.New("session token is required")
+	}
+	now := time.Now().UTC()
+	var result AuthenticatedSession
+	var deviceID, name, recipient, fingerprint sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT u.github_user_id, u.login, s.device_id, d.name, d.public_recipient, d.fingerprint
+		FROM sessions s JOIN github_users u ON u.github_user_id = s.github_user_id
+		LEFT JOIN devices d ON d.id = s.device_id AND d.revoked_at IS NULL
+		WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`, tokenHash(token), now).Scan(&result.User.ID, &result.User.Login, &deviceID, &name, &recipient, &fingerprint)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AuthenticatedSession{}, errors.New("session is invalid or expired")
+		}
+		return AuthenticatedSession{}, fmt.Errorf("authenticate session: %w", err)
+	}
+	if deviceID.Valid {
+		result.Device = Device{ID: deviceID.String, GitHubUserID: result.User.ID, Name: name.String, PublicRecipient: recipient.String, Fingerprint: fingerprint.String}
+	}
+	_, _ = s.db.ExecContext(ctx, `UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?`, now, tokenHash(token))
+	return result, nil
+}
+
+// RegisterDevice associates an active session with its locally generated age
+// recipient. It receives only public identity metadata.
+func (s *Store) RegisterDevice(ctx context.Context, token, id, name, recipient, fingerprint string) (Device, error) {
+	if token == "" || id == "" || !validDeviceText(name, 128) || !validDeviceText(recipient, 256) || !validDeviceText(fingerprint, 128) {
+		return Device{}, errors.New("invalid device registration")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Device{}, fmt.Errorf("begin device registration: %w", err)
+	}
+	defer tx.Rollback()
+	var userID int64
+	err = tx.QueryRowContext(ctx, `SELECT github_user_id FROM sessions WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?`, tokenHash(token), time.Now().UTC()).Scan(&userID)
+	if err != nil {
+		return Device{}, errors.New("session is invalid or expired")
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO devices(id, github_user_id, name, public_recipient, fingerprint, created_at, last_seen_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(public_recipient) DO UPDATE SET name = excluded.name, last_seen_at = excluded.last_seen_at WHERE devices.github_user_id = excluded.github_user_id AND devices.revoked_at IS NULL`, id, userID, name, recipient, fingerprint, now, now); err != nil {
+		return Device{}, fmt.Errorf("store device: %w", err)
+	}
+	var device Device
+	err = tx.QueryRowContext(ctx, `SELECT id, github_user_id, name, public_recipient, fingerprint, created_at, last_seen_at FROM devices WHERE public_recipient = ? AND revoked_at IS NULL`, recipient).Scan(&device.ID, &device.GitHubUserID, &device.Name, &device.PublicRecipient, &device.Fingerprint, &device.CreatedAt, &device.LastSeenAt)
+	if err != nil || device.GitHubUserID != userID {
+		return Device{}, errors.New("device recipient belongs to another user or is revoked")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET device_id = ?, last_seen_at = ? WHERE token_hash = ?`, device.ID, now, tokenHash(token)); err != nil {
+		return Device{}, fmt.Errorf("associate session device: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Device{}, fmt.Errorf("commit device registration: %w", err)
+	}
+	return device, nil
+}
+
+// RevokeSession invalidates exactly the presented opaque token.
+func (s *Store) RevokeSession(ctx context.Context, token string) error {
+	if token == "" {
+		return errors.New("session token is required")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL`, time.Now().UTC(), tokenHash(token))
+	if err != nil {
+		return fmt.Errorf("revoke session: %w", err)
+	}
+	return nil
+}
+
+// DevicesForUser returns only public, active device identity metadata.
+func (s *Store) DevicesForUser(ctx context.Context, githubUserID int64) ([]Device, error) {
+	if githubUserID <= 0 {
+		return nil, errors.New("GitHub user ID must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, github_user_id, name, public_recipient, fingerprint, created_at, last_seen_at FROM devices WHERE github_user_id = ? AND revoked_at IS NULL ORDER BY created_at, id`, githubUserID)
+	if err != nil {
+		return nil, fmt.Errorf("list devices: %w", err)
+	}
+	defer rows.Close()
+	var devices []Device
+	for rows.Next() {
+		var device Device
+		if err := rows.Scan(&device.ID, &device.GitHubUserID, &device.Name, &device.PublicRecipient, &device.Fingerprint, &device.CreatedAt, &device.LastSeenAt); err != nil {
+			return nil, fmt.Errorf("scan device: %w", err)
+		}
+		devices = append(devices, device)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate devices: %w", err)
+	}
+	return devices, nil
+}
+
+func tokenHash(token string) []byte { sum := sha256.Sum256([]byte(token)); return sum[:] }
+
+func validDeviceText(value string, limit int) bool {
+	return value != "" && strings.TrimSpace(value) == value && len(value) <= limit
 }
 
 // RepositoryConfigSnapshot is the ciphertext-free, validated repository

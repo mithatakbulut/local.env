@@ -454,7 +454,7 @@ func Manifest(name, publicURL string) ([]byte, error) {
 		URL:          base.String(),
 		Public:       false,
 		RedirectURL:  join("/setup/github-app/callback"),
-		CallbackURLs: []string{join("/auth/github/callback")},
+		CallbackURLs: []string{join("/auth/github/callback"), join("/auth/cli/callback")},
 		HookAttributes: map[string]any{
 			"url":    join("/api/v1/github/webhook"),
 			"active": true,

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/age"
 	"github.com/localenv/localenv/internal/config"
 	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/pranalysis"
@@ -22,9 +23,10 @@ import (
 )
 
 const (
-	oauthStateCookie = "localenv_oauth_state"
-	setupCookie      = "localenv_setup"
-	maxWebhookBytes  = 2 << 20
+	oauthStateCookie    = "localenv_oauth_state"
+	cliOAuthStateCookie = "localenv_cli_oauth_state"
+	setupCookie         = "localenv_setup"
+	maxWebhookBytes     = 2 << 20
 )
 
 type readinessStore interface{ Ready(context.Context) error }
@@ -50,6 +52,16 @@ type readinessPRStore interface {
 	SavePullRequestRequirements(context.Context, githubapp.PullRequest, []pranalysis.Requirement) (sqlite.PullRequestReadiness, error)
 	ClosePullRequest(context.Context, githubapp.PullRequest) error
 	SaveReadinessPublication(context.Context, int64, int, int64, int64) error
+}
+
+type cliAuthStore interface {
+	CreateAuthExchange(context.Context, githubapp.User, string, time.Time) error
+	ConsumeAuthExchange(context.Context, string) (githubapp.User, error)
+	CreateSession(context.Context, githubapp.User, string, time.Time) error
+	AuthenticateSession(context.Context, string) (sqlite.AuthenticatedSession, error)
+	RegisterDevice(context.Context, string, string, string, string, string) (sqlite.Device, error)
+	DevicesForUser(context.Context, int64) ([]sqlite.Device, error)
+	RevokeSession(context.Context, string) error
 }
 
 // Server holds dependencies for HTTP handlers.
@@ -80,6 +92,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /setup/github-app/callback", s.githubAppCallback)
 	mux.HandleFunc("GET /auth/github/start", s.githubAuthStart)
 	mux.HandleFunc("GET /auth/github/callback", s.githubAuthCallback)
+	mux.HandleFunc("GET /auth/cli/start", s.cliAuthStart)
+	mux.HandleFunc("GET /auth/cli/callback", s.cliAuthCallback)
+	mux.HandleFunc("POST /api/v1/auth/exchange", s.cliExchange)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.cliLogout)
+	mux.HandleFunc("GET /api/v1/me", s.me)
+	mux.HandleFunc("POST /api/v1/devices", s.registerDevice)
+	mux.HandleFunc("GET /api/v1/devices", s.devices)
 	mux.HandleFunc("POST /api/v1/github/webhook", s.githubWebhook)
 	return mux
 }
@@ -214,6 +233,192 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearCookie(w, oauthStateCookie)
 	http.Redirect(w, r, "/setup", http.StatusFound)
+}
+
+// cliAuthStart creates browser state bound to a local loopback callback. The
+// callback is intentionally constrained to 127.0.0.1/::1 so a login code can
+// never be redirected to an arbitrary remote host.
+func (s *Server) cliAuthStart(w http.ResponseWriter, r *http.Request) {
+	callback, ok := loopbackCallback(r.URL.Query().Get("redirect_uri"))
+	if !ok || s.config.PublicURL == nil {
+		http.Error(w, "CLI login is unavailable", http.StatusBadRequest)
+		return
+	}
+	clientID, _, ok := s.oauthCredentials()
+	if !ok {
+		http.Error(w, "GitHub OAuth is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := randomToken()
+	if err != nil || !s.writeCookie(w, cliOAuthStateCookie, cliOAuthState{State: state, CallbackURL: callback.String(), ExpiresAt: time.Now().UTC().Add(10 * time.Minute)}, 10*time.Minute) {
+		http.Error(w, "could not start CLI sign-in", http.StatusInternalServerError)
+		return
+	}
+	authorizeURL, err := s.github.AuthorizationURL(clientID, s.publicURL("/auth/cli/callback"), state)
+	if err != nil {
+		http.Error(w, "could not start CLI sign-in", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, authorizeURL, http.StatusFound)
+}
+
+func (s *Server) cliAuthCallback(w http.ResponseWriter, r *http.Request) {
+	state, found := s.readCLIOAuthState(r)
+	if !found || state.Expired() || r.URL.Query().Get("code") == "" || r.URL.Query().Get("state") != state.State {
+		http.Error(w, "CLI sign-in could not be verified", http.StatusBadRequest)
+		return
+	}
+	callback, ok := loopbackCallback(state.CallbackURL)
+	if !ok {
+		http.Error(w, "CLI sign-in callback is invalid", http.StatusBadRequest)
+		return
+	}
+	clientID, clientSecret, ok := s.oauthCredentials()
+	if !ok {
+		http.Error(w, "GitHub OAuth is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	githubToken, err := s.github.ExchangeOAuthCode(ctx, clientID, clientSecret, r.URL.Query().Get("code"), s.publicURL("/auth/cli/callback"))
+	if err != nil {
+		http.Error(w, "GitHub sign-in failed", http.StatusBadGateway)
+		return
+	}
+	user, _, err := s.github.UserAndOrganizations(ctx, githubToken)
+	if err != nil {
+		http.Error(w, "GitHub identity lookup failed", http.StatusBadGateway)
+		return
+	}
+	store, ok := s.store.(cliAuthStore)
+	if !ok {
+		http.Error(w, "CLI authentication persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	exchange, err := randomToken()
+	if err != nil || store.CreateAuthExchange(ctx, user, exchange, time.Now().UTC().Add(5*time.Minute)) != nil {
+		http.Error(w, "could not complete CLI sign-in", http.StatusInternalServerError)
+		return
+	}
+	query := callback.Query()
+	query.Set("code", exchange)
+	callback.RawQuery = query.Encode()
+	s.clearCookie(w, cliOAuthStateCookie)
+	http.Redirect(w, r, callback.String(), http.StatusFound)
+}
+
+func (s *Server) cliExchange(w http.ResponseWriter, r *http.Request) {
+	store, ok := s.store.(cliAuthStore)
+	if !ok {
+		http.Error(w, "CLI authentication persistence is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		Code string `json:"code"`
+	}
+	if !decodeRequestJSON(w, r, &request) || request.Code == "" {
+		http.Error(w, "invalid authentication exchange", http.StatusBadRequest)
+		return
+	}
+	user, err := store.ConsumeAuthExchange(r.Context(), request.Code)
+	if err != nil {
+		http.Error(w, "invalid authentication exchange", http.StatusUnauthorized)
+		return
+	}
+	token, err := randomToken()
+	if err != nil || store.CreateSession(r.Context(), user, token, time.Now().UTC().Add(30*24*time.Hour)) != nil {
+		http.Error(w, "could not create session", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Token     string         `json:"token"`
+		ExpiresAt time.Time      `json:"expires_at"`
+		User      githubapp.User `json:"user"`
+	}{Token: token, ExpiresAt: time.Now().UTC().Add(30 * 24 * time.Hour), User: user})
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	authenticated, token, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	_ = token
+	writeJSON(w, http.StatusOK, struct {
+		User   githubapp.User `json:"user"`
+		Device sqlite.Device  `json:"device"`
+	}{User: authenticated.User, Device: authenticated.Device})
+}
+
+func (s *Server) registerDevice(w http.ResponseWriter, r *http.Request) {
+	_, token, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	var request struct {
+		ID              string `json:"id"`
+		Name            string `json:"name"`
+		PublicRecipient string `json:"public_recipient"`
+		Fingerprint     string `json:"fingerprint"`
+	}
+	if !decodeRequestJSON(w, r, &request) || request.ID == "" || request.Name == "" || request.Fingerprint == "" {
+		http.Error(w, "invalid device registration", http.StatusBadRequest)
+		return
+	}
+	if _, err := age.ParseX25519Recipient(request.PublicRecipient); err != nil {
+		http.Error(w, "invalid device registration", http.StatusBadRequest)
+		return
+	}
+	store := s.store.(cliAuthStore)
+	device, err := store.RegisterDevice(r.Context(), token, request.ID, request.Name, request.PublicRecipient, request.Fingerprint)
+	if err != nil {
+		http.Error(w, "device registration failed", http.StatusForbidden)
+		return
+	}
+	writeJSON(w, http.StatusCreated, device)
+}
+
+func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
+	authenticated, _, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	devices, err := s.store.(cliAuthStore).DevicesForUser(r.Context(), authenticated.User.ID)
+	if err != nil {
+		http.Error(w, "could not list devices", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, devices)
+}
+
+func (s *Server) cliLogout(w http.ResponseWriter, r *http.Request) {
+	_, token, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.(cliAuthStore).RevokeSession(r.Context(), token); err != nil {
+		http.Error(w, "could not revoke session", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (sqlite.AuthenticatedSession, string, bool) {
+	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if token == "" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return sqlite.AuthenticatedSession{}, "", false
+	}
+	store, ok := s.store.(cliAuthStore)
+	if !ok {
+		http.Error(w, "CLI authentication persistence is unavailable", http.StatusServiceUnavailable)
+		return sqlite.AuthenticatedSession{}, "", false
+	}
+	result, err := store.AuthenticateSession(r.Context(), token)
+	if err != nil {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return sqlite.AuthenticatedSession{}, "", false
+	}
+	return result, token, true
 }
 
 func (s *Server) createGitHubApp(w http.ResponseWriter, r *http.Request) {
@@ -442,6 +647,10 @@ func (s *Server) readOAuthState(r *http.Request) (oauthState, bool) {
 	var v oauthState
 	return v, s.readCookie(r, oauthStateCookie, &v) && !v.ExpiresAt.IsZero()
 }
+func (s *Server) readCLIOAuthState(r *http.Request) (cliOAuthState, bool) {
+	var v cliOAuthState
+	return v, s.readCookie(r, cliOAuthStateCookie, &v) && !v.ExpiresAt.IsZero()
+}
 func (s *Server) readSetupSession(r *http.Request) (setupSession, bool) {
 	var v setupSession
 	return v, s.readCookie(r, setupCookie, &v) && !v.ExpiresAt.IsZero()
@@ -493,6 +702,45 @@ type oauthState struct {
 }
 
 func (s oauthState) Expired() bool { return time.Now().UTC().After(s.ExpiresAt) }
+
+type cliOAuthState struct {
+	State       string    `json:"state"`
+	CallbackURL string    `json:"callback_url"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+func (s cliOAuthState) Expired() bool { return time.Now().UTC().After(s.ExpiresAt) }
+
+func loopbackCallback(raw string) (*url.URL, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return nil, false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host != "127.0.0.1" && host != "::1" && host != "localhost" || parsed.Port() == "" {
+		return nil, false
+	}
+	return parsed, true
+}
+
+func decodeRequestJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	if r.Body == nil {
+		return false
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(target) != nil {
+		return false
+	}
+	var extra any
+	return decoder.Decode(&extra) == io.EOF
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
 
 type setupSession struct {
 	User                 githubapp.User           `json:"user"`

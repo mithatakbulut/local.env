@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -18,10 +19,108 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
 	"github.com/localenv/localenv/internal/config"
 	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/store/sqlite"
 )
+
+func TestCLIAuthenticationExchangesOneTimeCodeRegistersDeviceAndRevokesSession(t *testing.T) {
+	gitHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
+			_, _ = w.Write([]byte(`{"access_token":"test-github-access-token"}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"id":31,"login":"developer"}`))
+		case "/user/orgs":
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(gitHub.Close)
+	store, err := sqlite.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	app := NewWithGitHubClient(config.Config{
+		DataDir:                           t.TempDir(),
+		PublicURL:                         mustURL(t, "https://env.example.test"),
+		GitHubOAuthClientID:               "test-client",
+		GitHubOAuthClientSecret:           "non-secret-test-client-secret",
+		GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32)),
+	}, store, githubapp.Client{HTTPClient: gitHub.Client(), APIBaseURL: gitHub.URL, OAuthURL: gitHub.URL + "/login/oauth"})
+
+	start := httptest.NewRecorder()
+	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/auth/cli/start?redirect_uri=http%3A%2F%2F127.0.0.1%3A43124%2Fcallback", nil))
+	if start.Code != http.StatusFound {
+		t.Fatalf("CLI auth start = %d, want 302", start.Code)
+	}
+	state := mustURL(t, start.Header().Get("Location")).Query().Get("state")
+	callback := httptest.NewRequest(http.MethodGet, "/auth/cli/callback?code=github-code&state="+url.QueryEscape(state), nil)
+	callback.AddCookie(cookieNamed(t, start.Result().Cookies(), cliOAuthStateCookie))
+	complete := httptest.NewRecorder()
+	app.Handler().ServeHTTP(complete, callback)
+	if complete.Code != http.StatusFound {
+		t.Fatalf("CLI auth callback = %d, want 302", complete.Code)
+	}
+	exchangeCode := mustURL(t, complete.Header().Get("Location")).Query().Get("code")
+	if exchangeCode == "" {
+		t.Fatal("CLI callback did not contain exchange code")
+	}
+	exchangeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{"code":"`+exchangeCode+`"}`))
+	exchangeRequest.Header.Set("Content-Type", "application/json")
+	exchange := httptest.NewRecorder()
+	app.Handler().ServeHTTP(exchange, exchangeRequest)
+	if exchange.Code != http.StatusOK {
+		t.Fatalf("exchange = %d, body = %s", exchange.Code, exchange.Body.String())
+	}
+	var session struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(exchange.Body.Bytes(), &session); err != nil || session.Token == "" {
+		t.Fatalf("exchange session = %#v, %v", session, err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := httptest.NewRequest(http.MethodPost, "/api/v1/devices", strings.NewReader(`{"id":"device-1","name":"laptop","public_recipient":"`+identity.Recipient().String()+`","fingerprint":"sha256:0000000000000000"}`))
+	registration.Header.Set("Content-Type", "application/json")
+	registration.Header.Set("Authorization", "Bearer "+session.Token)
+	registered := httptest.NewRecorder()
+	app.Handler().ServeHTTP(registered, registration)
+	if registered.Code != http.StatusCreated || strings.Contains(registered.Body.String(), session.Token) {
+		t.Fatalf("device registration = %d, body = %s", registered.Code, registered.Body.String())
+	}
+	meRequest := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	meRequest.Header.Set("Authorization", "Bearer "+session.Token)
+	me := httptest.NewRecorder()
+	app.Handler().ServeHTTP(me, meRequest)
+	if me.Code != http.StatusOK || !strings.Contains(me.Body.String(), `"login":"developer"`) || !strings.Contains(me.Body.String(), `"id":"device-1"`) || strings.Contains(me.Body.String(), session.Token) {
+		t.Fatalf("me = %d, body = %s", me.Code, me.Body.String())
+	}
+	devicesRequest := httptest.NewRequest(http.MethodGet, "/api/v1/devices", nil)
+	devicesRequest.Header.Set("Authorization", "Bearer "+session.Token)
+	devices := httptest.NewRecorder()
+	app.Handler().ServeHTTP(devices, devicesRequest)
+	if devices.Code != http.StatusOK || !strings.Contains(devices.Body.String(), `"fingerprint":"sha256:0000000000000000"`) {
+		t.Fatalf("devices = %d, body = %s", devices.Code, devices.Body.String())
+	}
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	logoutRequest.Header.Set("Authorization", "Bearer "+session.Token)
+	logout := httptest.NewRecorder()
+	app.Handler().ServeHTTP(logout, logoutRequest)
+	if logout.Code != http.StatusNoContent {
+		t.Fatalf("logout = %d", logout.Code)
+	}
+	after := httptest.NewRecorder()
+	app.Handler().ServeHTTP(after, meRequest)
+	if after.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked session me = %d, want 401", after.Code)
+	}
+}
 
 type testStore struct{ err error }
 
