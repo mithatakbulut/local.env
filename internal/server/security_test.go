@@ -120,6 +120,8 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":11,"login":"outsider"}`))
 		case "/user/orgs":
 			_, _ = w.Write([]byte(`[{"id":8,"login":"other"}]`))
+		case "/user/memberships/orgs/acme":
+			_, _ = w.Write([]byte(`{"state":"pending","organization":{"id":7,"login":"acme"}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -138,5 +140,49 @@ func TestDashboardLoginRejectsUsersOutsideConfiguredOrganization(t *testing.T) {
 	app.Handler().ServeHTTP(response, callback)
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("non-member dashboard callback = %d", response.Code)
+	}
+}
+
+func TestDashboardLoginUsesDirectActiveMembership(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.ConfigureGitHubInstance(context.Background(), 7, "acme", 9, "https://env.example.test", "local.env"); err != nil {
+		t.Fatal(err)
+	}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
+			_, _ = w.Write([]byte(`{"access_token":"oauth-token"}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"id":11,"login":"member"}`))
+		case "/user/orgs":
+			// GitHub's organization listing may omit an otherwise active membership.
+			_, _ = w.Write([]byte(`[{"id":8,"login":"other"}]`))
+		case "/user/memberships/orgs/acme":
+			_, _ = w.Write([]byte(`{"state":"active","organization":{"id":7,"login":"acme"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(github.Close)
+	app := NewWithGitHubClient(config.Config{DataDir: t.TempDir(), PublicURL: mustURL(t, "https://env.example.test"), GitHubOAuthClientID: "client", GitHubOAuthClientSecret: "non-secret-test", GitHubAppCredentialsEncryptionKey: []byte(strings.Repeat("a", 32))}, store, githubapp.Client{HTTPClient: github.Client(), APIBaseURL: github.URL, OAuthURL: github.URL + "/login/oauth"})
+	start := httptest.NewRecorder()
+	app.Handler().ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/login", nil))
+	location, err := url.Parse(start.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/auth/github/callback?code=code&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	callback.AddCookie(cookieNamed(t, start.Result().Cookies(), oauthStateCookie))
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, callback)
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "/repos" {
+		t.Fatalf("dashboard callback = %d %q, want redirect to /repos", response.Code, response.Header().Get("Location"))
+	}
+	if cookieNamed(t, response.Result().Cookies(), dashboardCookie) == nil {
+		t.Fatal("dashboard callback did not create a dashboard session")
 	}
 }

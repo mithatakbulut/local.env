@@ -160,6 +160,27 @@ func (c Client) UserAndOrganizations(ctx context.Context, token string) (User, [
 	return user, filtered, nil
 }
 
+// ActiveOrganizationMembership verifies the current OAuth user's active
+// membership in one named organization. Dashboard authorization must use this
+// direct membership endpoint instead of inferring membership from a list of
+// organizations, which can be incomplete under organization access policies.
+func (c Client) ActiveOrganizationMembership(ctx context.Context, token, organizationLogin string) (Organization, error) {
+	if !validGitHubLogin(organizationLogin) {
+		return Organization{}, errors.New("invalid GitHub organization login")
+	}
+	var membership struct {
+		State        string       `json:"state"`
+		Organization Organization `json:"organization"`
+	}
+	if err := c.getJSON(ctx, "/user/memberships/orgs/"+url.PathEscape(organizationLogin), token, &membership); err != nil {
+		return Organization{}, err
+	}
+	if membership.State != "active" || membership.Organization.ID <= 0 || membership.Organization.Login != organizationLogin {
+		return Organization{}, errors.New("GitHub organization membership is not active")
+	}
+	return membership.Organization, nil
+}
+
 type ManifestConversion struct {
 	ID            int64  `json:"id"`
 	PEM           string `json:"pem"`

@@ -643,12 +643,17 @@ func (s *Server) githubAuthCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "dashboard is unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		organizationID, orgErr := store.DashboardOrganizationID(ctx)
-		if orgErr != nil || !memberOfOrganization(organizations, organizationID) {
+		organization, orgErr := store.DashboardOrganization(ctx)
+		if orgErr != nil {
 			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
 			return
 		}
-		session := dashboardSession{User: user, OrganizationID: organizationID, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
+		membership, membershipErr := s.github.ActiveOrganizationMembership(ctx, token, organization.Login)
+		if membershipErr != nil || membership.ID != organization.ID {
+			http.Error(w, "GitHub organization membership is required for dashboard access", http.StatusForbidden)
+			return
+		}
+		session := dashboardSession{User: user, OrganizationID: organization.ID, ExpiresAt: time.Now().UTC().Add(8 * time.Hour)}
 		if !s.writeCookie(w, dashboardCookie, session, 8*time.Hour) {
 			http.Error(w, "could not complete dashboard sign-in", http.StatusInternalServerError)
 			return
@@ -1417,15 +1422,6 @@ type oauthState struct {
 	State     string    `json:"state"`
 	Audience  string    `json:"audience,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
-}
-
-func memberOfOrganization(organizations []githubapp.Organization, wanted int64) bool {
-	for _, organization := range organizations {
-		if organization.ID == wanted {
-			return true
-		}
-	}
-	return false
 }
 
 func (s oauthState) Expired() bool { return time.Now().UTC().After(s.ExpiresAt) }

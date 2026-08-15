@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/localenv/localenv/internal/githubapp"
 	"github.com/localenv/localenv/internal/pranalysis"
 )
 
@@ -44,17 +45,20 @@ type AuditEvent struct {
 	CreatedAt     time.Time
 }
 
-// DashboardOrganizationID identifies the one organization configured for the
-// instance, allowing the server to check an OAuth user's organization list.
-func (s *Store) DashboardOrganizationID(ctx context.Context) (int64, error) {
-	var id int64
-	if err := s.db.QueryRowContext(ctx, `SELECT github_org_id FROM instance WHERE id = 'singleton'`).Scan(&id); err != nil {
+// DashboardOrganization identifies the one organization configured for the
+// instance, allowing the server to check an OAuth user's direct membership.
+func (s *Store) DashboardOrganization(ctx context.Context) (githubapp.Organization, error) {
+	var organization githubapp.Organization
+	if err := s.db.QueryRowContext(ctx, `SELECT github_org_id, github_org_login FROM instance WHERE id = 'singleton'`).Scan(&organization.ID, &organization.Login); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 0, errors.New("GitHub App setup has not completed")
+			return githubapp.Organization{}, errors.New("GitHub App setup has not completed")
 		}
-		return 0, fmt.Errorf("read dashboard organization: %w", err)
+		return githubapp.Organization{}, fmt.Errorf("read dashboard organization: %w", err)
 	}
-	return id, nil
+	if organization.ID <= 0 || organization.Login == "" {
+		return githubapp.Organization{}, errors.New("configured dashboard organization is incomplete")
+	}
+	return organization, nil
 }
 
 // DashboardRepositories returns only configured repository metadata.

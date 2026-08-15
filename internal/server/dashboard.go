@@ -16,7 +16,7 @@ import (
 const dashboardCookie = "localenv_dashboard"
 
 type dashboardStore interface {
-	DashboardOrganizationID(context.Context) (int64, error)
+	DashboardOrganization(context.Context) (githubapp.Organization, error)
 	DashboardRepositories(context.Context) ([]sqlite.DashboardRepository, error)
 	DashboardRepository(context.Context, string, string) (sqlite.DashboardRepository, error)
 	DashboardPullRequest(context.Context, string, string, int) (sqlite.DashboardPullRequest, error)
@@ -66,8 +66,8 @@ func (s *Server) requireDashboard(w http.ResponseWriter, r *http.Request) (dashb
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return nil, dashboardSession{}, false
 	}
-	organizationID, err := store.DashboardOrganizationID(r.Context())
-	if err != nil || organizationID != session.OrganizationID {
+	organization, err := store.DashboardOrganization(r.Context())
+	if err != nil || organization.ID != session.OrganizationID {
 		s.clearCookie(w, dashboardCookie)
 		http.Error(w, "dashboard session is no longer valid", http.StatusForbidden)
 		return nil, dashboardSession{}, false
