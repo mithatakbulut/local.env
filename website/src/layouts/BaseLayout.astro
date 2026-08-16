@@ -1,0 +1,60 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const canonicalURL = new URL(Astro.url.pathname, Astro.site);
+const ogImage = new URL("/images/local-env-og.png", Astro.site);
+const repositoryURL = "https://github.com/mithatakbulut/local.env";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalURL} />
+    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="icon" href="/favicon.png" type="image/png" />
+    <meta name="theme-color" content="#09111c" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="local.env" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:image" content={ogImage} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+    <title>{title}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <a class="wordmark" href="/" aria-label="local.env home"><img src="/images/local-env-asterisk-192.png" width="32" height="32" alt="" /><span>local.env</span></a>
+      <nav aria-label="Primary navigation">
+        <a href="/docs/">Docs</a>
+        <a href="/blog/">Blog</a>
+        <a class="header-github" href={repositoryURL}>GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+    <main id="main-content"><slot /></main>
+    <footer class="site-footer">
+      <div class="footer-brand"><a class="wordmark" href="/" aria-label="local.env home"><img src="/images/local-env-asterisk-192.png" width="32" height="32" alt="" /><span>local.env</span></a><p>Self-hosted coordination for local development environments.</p></div>
+      <nav aria-label="Footer navigation">
+        <a href="/docs/">Docs</a>
+        <a href="/blog/">Blog</a>
+        <a href={repositoryURL}>GitHub</a>
+        <a href={`${repositoryURL}/blob/main/LICENSE`}>Apache-2.0 license</a>
+        <a href={`${repositoryURL}/security/policy`}>Security policy</a>
+      </nav>
+      <p class="footer-cost">You operate and fund your own hosting, domain, and optional platform services.</p>
+    </footer>
+  </body>
+</html>

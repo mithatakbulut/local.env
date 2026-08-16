@@ -1,0 +1,126 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout
+  title="local.env — local development, in sync"
+  description="Keep local development environments in sync on infrastructure you control."
+>
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <p class="eyebrow">Self-hosted environment coordination</p>
+      <h1 id="hero-title">Keep local development environments in sync — on infrastructure you control.</h1>
+      <p class="lede">local.env connects GitHub pull-request readiness with a local CLI, so the environment contract can change alongside your code.</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="/docs/overview/">Read the docs <span aria-hidden="true">→</span></a>
+        <a class="button button-secondary" href="https://github.com/mithatakbulut/local.env">View on GitHub <span aria-hidden="true">↗</span></a>
+      </div>
+      <p class="cost-note">Apache-2.0 licensed free software. You choose and pay for your own hosting, domain, and optional platform services.</p>
+    </div>
+    <div class="hero-visual" role="img" aria-label="A local.env workflow: repository contract, GitHub pull request readiness, local CLI, and a safely synced local environment file.">
+      <div class="hero-grid" aria-hidden="true"></div>
+      <div class="hero-flow" aria-hidden="true">
+        <div class="flow-node flow-repository">
+          <span class="flow-icon">*</span>
+          <span class="flow-kicker">Repository</span>
+          <strong>environment contract</strong>
+        </div>
+        <span class="flow-connector">↓</span>
+        <div class="flow-node flow-pr">
+          <span class="flow-kicker">GitHub pull request</span>
+          <strong>readiness checked</strong>
+        </div>
+        <span class="flow-connector">↓</span>
+        <div class="flow-node flow-cli">
+          <span class="flow-kicker">Local CLI</span>
+          <strong>resolve on your device</strong>
+        </div>
+        <span class="flow-connector">↓</span>
+        <div class="flow-node flow-sync">
+          <span class="flow-kicker">.env.local</span>
+          <strong>safe managed sync</strong>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section workflow-section" aria-labelledby="workflow-title">
+    <div class="section-heading">
+      <p class="eyebrow">A visible workflow</p>
+      <h2 id="workflow-title">The environment change follows the code change.</h2>
+      <p>local.env is built for local development teams—not production, staging, CI, or general-purpose credential storage.</p>
+    </div>
+    <ol class="workflow-list">
+      <li><span class="step-number">01</span><h3>Commit the contract</h3><p>Keep the repository’s local environment schema alongside the application code.</p></li>
+      <li><span class="step-number">02</span><h3>See PR readiness</h3><p>GitHub checks make new local requirements clear before a change is merged.</p></li>
+      <li><span class="step-number">03</span><h3>Resolve locally</h3><p>Developers use the CLI on their own machines to resolve missing requirements.</p></li>
+      <li><span class="step-number">04</span><h3>Sync safely</h3><p>The CLI writes only its managed local block, leaving unrelated local configuration alone.</p></li>
+    </ol>
+  </section>
+
+  <section class="section boundary-section" aria-labelledby="boundary-title">
+    <div class="boundary-copy">
+      <p class="eyebrow">A deliberate security boundary</p>
+      <h2 id="boundary-title">The server coordinates encrypted data. Plaintext stays on developer devices.</h2>
+      <p>Managed values and repository encryption keys are handled locally by the CLI. The server stores encrypted values and device-specific wrapped repository keys, not managed plaintext or plaintext repository encryption keys.</p>
+      <a class="text-link" href="/docs/security/security-model/">Read the security model in the docs <span aria-hidden="true">→</span></a>
+    </div>
+    <dl class="boundary-list">
+      <div><dt>Local CLI</dt><dd>Creates, decrypts, and writes managed local values.</dd></div>
+      <div><dt>Self-hosted server</dt><dd>Tracks metadata, encrypted snapshots, and device access.</dd></div>
+      <div><dt>GitHub integration</dt><dd>Reports whether a pull request’s local requirements are ready.</dd></div>
+    </dl>
+  </section>
+
+  <section class="section proof-section" aria-labelledby="proof-title">
+    <div class="section-heading section-heading-wide">
+      <p class="eyebrow">Synthetic product previews</p>
+      <h2 id="proof-title">A focused dashboard for repository and device metadata.</h2>
+      <p>These previews use only controlled synthetic labels. The dashboard never accepts or displays managed secret values.</p>
+    </div>
+    <div class="proof-grid">
+      <figure class="proof-card">
+        <div class="demo-window demo-repository" aria-hidden="true">
+          <div class="demo-sidebar"><span class="demo-mark">*</span><span></span><span></span><span></span></div>
+          <div class="demo-content"><div class="demo-topline"><b>Repositories</b><i>1 managed repository</i></div><div class="demo-repo"><strong>demo-lab/api</strong><small>main</small><em>1 missing requirement</em><div><span>Managed keys <b>3</b></span><span>Open PRs <b>1</b></span><span>Revision <b>8</b></span></div></div></div>
+        </div>
+        <figcaption><strong>Repository readiness</strong><span>Track contract state without exposing values.</span></figcaption>
+      </figure>
+      <figure class="proof-card">
+        <div class="demo-window demo-devices" aria-hidden="true">
+          <div class="demo-sidebar"><span class="demo-mark">*</span><span></span><span></span><span></span></div>
+          <div class="demo-content"><div class="demo-topline"><b>Devices</b><i>2 active devices</i></div><div class="demo-device"><span class="device-dot"></span><div><strong>Demo laptop</strong><small>fingerprint · approved today</small></div><em>Active</em></div><div class="demo-device"><span class="device-dot"></span><div><strong>Demo workstation</strong><small>fingerprint · approved today</small></div><em>Active</em></div></div>
+        </div>
+        <figcaption><strong>Device access</strong><span>Approve the devices allowed to receive repository access.</span></figcaption>
+      </figure>
+      <figure class="proof-card">
+        <div class="demo-window demo-settings" aria-hidden="true">
+          <div class="demo-sidebar"><span class="demo-mark">*</span><span></span><span></span><span></span></div>
+          <div class="demo-content"><div class="demo-topline"><b>Settings</b><i>Self-hosted instance</i></div><div class="demo-setting"><span class="demo-logo">D</span><div><small>Display name</small><strong>Demo Local Env</strong></div></div><p class="demo-callout">Configured logo and favicon use validated HTTPS URLs.</p></div>
+        </div>
+        <figcaption><strong>Branding and settings</strong><span>White-label configuration is limited to the display name, logo, and favicon.</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section host-section" aria-labelledby="host-title">
+    <div class="host-mark" aria-hidden="true">*</div>
+    <div>
+      <p class="eyebrow">Run it your way</p>
+      <h2 id="host-title">Self-host the service your team uses.</h2>
+      <p>Run local.env with Docker, connect the GitHub App your organization owns, and use your own domain. Instance branding is intentionally narrow: display name, logo, and favicon—not arbitrary dashboard code or CSS.</p>
+    </div>
+    <a class="button button-secondary" href="https://local.env.best/login">Open your instance <span aria-hidden="true">↗</span></a>
+  </section>
+
+  <section class="section journeys-section" aria-labelledby="journeys-title">
+    <div class="section-heading">
+      <p class="eyebrow">Start with your role</p>
+      <h2 id="journeys-title">Two clear paths into local.env.</h2>
+    </div>
+    <div class="journey-grid">
+      <article class="journey-card"><p class="journey-label">For operators</p><h3>I run an instance</h3><p>Deploy the service, configure its public URL and GitHub setup, then verify the instance.</p><a class="text-link" href="/docs/self-host/prerequisites/">Start self-hosting <span aria-hidden="true">→</span></a></article>
+      <article class="journey-card"><p class="journey-label">For developers</p><h3>I join an instance</h3><p>Install the CLI, sign in, register a device, and bring a repository’s local contract into sync.</p><a class="text-link" href="/docs/join-an-instance/prerequisites/">Start joining <span aria-hidden="true">→</span></a></article>
+    </div>
+  </section>
+</BaseLayout>
