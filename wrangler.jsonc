@@ -5,6 +5,7 @@
   "name": "localenv-public-site",
   "compatibility_date": "2026-08-15",
   "workers_dev": true,
+  "preview_urls": true,
   "build": {
     "command": "npm ci && npm run build",
     "cwd": "website"
