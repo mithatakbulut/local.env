@@ -47,7 +47,7 @@ localenv import path/to/example.env
 ```
 
 The CLI encrypts locally and uploads ciphertext only. Use files containing
-placeholder values such as `EXAMPLE_VALUE_DO_NOT_USE` in documentation—not
+placeholder values such as `EXAMPLE_VALUE_DO_NOT_USE` in documentation, not
 real secrets.
 
 ## Rules to remember

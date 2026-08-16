@@ -21,7 +21,7 @@ local dotenv target without disturbing unrelated content.
 localenv sync --dry-run
 ```
 
-Output lists key names and change categories only—never decrypted values.
+Output lists key names and change categories only, never decrypted values.
 
 2. Apply the sync:
 

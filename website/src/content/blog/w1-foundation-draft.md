@@ -2,7 +2,6 @@
 title: "Website foundation draft"
 description: "A build-only fixture proving that unpublished blog content is excluded."
 pubDate: 2026-08-16
-category: product-update
 draft: true
 ---
 

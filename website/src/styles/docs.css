@@ -1,0 +1,136 @@
+@font-face {
+  font-family: "Outfit Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/outfit/files/outfit-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Figtree Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300 900;
+  src: url("@fontsource-variable/figtree/files/figtree-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root,
+::backdrop {
+  color-scheme: dark;
+  --ink: #f5f7f4;
+  --muted: #aab3ad;
+  --faint: #737d76;
+  --canvas: #101311;
+  --surface: #171b18;
+  --surface-raised: #1d221e;
+  --line: #303832;
+  --line-strong: #4c5850;
+  --mint: #b9f957;
+  --mint-hover: #d2ff87;
+  --mint-ink: #172004;
+  --blue: #a9baff;
+  --gold: #ffe08b;
+  --font-display: "Outfit Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
+  --sl-font: var(--font-body);
+  --sl-color-white: var(--ink);
+  --sl-color-gray-1: #e8ece6;
+  --sl-color-gray-2: var(--muted);
+  --sl-color-gray-3: var(--faint);
+  --sl-color-gray-4: var(--line-strong);
+  --sl-color-gray-5: var(--line);
+  --sl-color-gray-6: var(--surface-raised);
+  --sl-color-black: var(--canvas);
+  --sl-color-accent-low: #263025;
+  --sl-color-accent: var(--mint);
+  --sl-color-accent-high: var(--mint-hover);
+  --sl-color-text: var(--muted);
+  --sl-color-text-accent: var(--mint);
+  --sl-color-text-invert: var(--mint-ink);
+  --sl-color-bg: var(--canvas);
+  --sl-color-bg-nav: var(--surface);
+  --sl-color-bg-sidebar: var(--surface);
+  --sl-color-bg-inline-code: var(--surface-raised);
+  --sl-color-bg-accent: var(--mint);
+  --sl-color-hairline-light: var(--line);
+  --sl-color-hairline: var(--surface-raised);
+  --sl-color-hairline-shade: var(--canvas);
+  --sl-hue-orange: 45;
+  --sl-color-orange-low: #3a3420;
+  --sl-color-orange: var(--gold);
+  --sl-color-orange-high: #fff3c8;
+  --sl-hue-green: 84;
+  --sl-color-green-low: #263025;
+  --sl-color-green: var(--mint);
+  --sl-color-green-high: var(--mint-hover);
+  --sl-hue-blue: 228;
+  --sl-color-blue-low: #23283a;
+  --sl-color-blue: var(--blue);
+  --sl-color-blue-high: #d5dcff;
+}
+
+:root[data-theme="light"],
+[data-theme="light"] ::backdrop {
+  color-scheme: light;
+  --ink: #101311;
+  --muted: #4c5850;
+  --faint: #737d76;
+  --canvas: #f5f7f4;
+  --surface: #eef1ec;
+  --surface-raised: #e4e8e2;
+  --line: #d5dbd4;
+  --line-strong: #b7c0b6;
+  --mint: #3f6f0a;
+  --mint-hover: #2f5407;
+  --mint-ink: #f5f7f4;
+  --blue: #3b4ea8;
+  --gold: #8c6000;
+  --sl-color-white: var(--ink);
+  --sl-color-gray-1: #171b18;
+  --sl-color-gray-2: #1d221e;
+  --sl-color-gray-3: #4c5850;
+  --sl-color-gray-4: #737d76;
+  --sl-color-gray-5: #aab3ad;
+  --sl-color-gray-6: var(--surface-raised);
+  --sl-color-gray-7: var(--surface);
+  --sl-color-black: var(--canvas);
+  --sl-color-accent-low: #e4f5b8;
+  --sl-color-accent: var(--mint);
+  --sl-color-accent-high: var(--mint-hover);
+  --sl-color-text: #3a433c;
+  --sl-color-text-accent: var(--mint);
+  --sl-color-text-invert: var(--canvas);
+  --sl-color-bg: var(--canvas);
+  --sl-color-bg-nav: var(--surface);
+  --sl-color-bg-sidebar: var(--canvas);
+  --sl-color-bg-inline-code: var(--surface-raised);
+  --sl-color-bg-accent: var(--mint);
+  --sl-color-hairline-light: var(--line);
+  --sl-color-hairline: var(--line);
+  --sl-color-hairline-shade: var(--line);
+  --sl-color-orange-high: #8c6000;
+  --sl-color-orange: #c9a227;
+  --sl-color-orange-low: #fff3c8;
+  --sl-color-green-high: #2f5407;
+  --sl-color-green: #3f6f0a;
+  --sl-color-green-low: #e4f5b8;
+  --sl-color-blue-high: #2c3c86;
+  --sl-color-blue: #3b4ea8;
+  --sl-color-blue-low: #e4e8ff;
+}
+
+h1,
+h2,
+h3,
+.site-title {
+  font-family: var(--font-display);
+}
+
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+select:focus-visible {
+  outline: 3px solid var(--gold);
+  outline-offset: 4px;
+}

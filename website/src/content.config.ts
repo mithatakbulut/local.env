@@ -10,7 +10,6 @@ const blog = defineCollection({
     title: z.string(),
     description: z.string(),
     pubDate: z.coerce.date(),
-    category: z.enum(["release-notes", "security-advisory", "product-update"]),
     draft: z.boolean().default(false)
   })
 });

@@ -25,13 +25,13 @@ production secrets.
 
 ## How the workflow fits together
 
-1. **Repository contract** — The team commits a `localenv.yaml` contract and
+1. **Repository contract:** The team commits a `localenv.yaml` contract and
    schema files that declare which local keys exist.
-2. **Pull-request readiness** — GitHub checks report whether an open PR's
+2. **Pull-request readiness:** GitHub checks report whether an open PR's
    local requirements are ready before merge.
-3. **Local resolution** — Developers use the CLI on their own machines to
+3. **Local resolution:** Developers use the CLI on their own machines to
    create or update encrypted values for missing requirements.
-4. **Safe sync** — The CLI writes only a marker-bounded managed block in the
+4. **Safe sync:** The CLI writes only a marker-bounded managed block in the
    configured target file and leaves unrelated local configuration alone.
 
 The dashboard shows repository, device, and audit **metadata only**. It never

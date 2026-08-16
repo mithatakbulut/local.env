@@ -234,12 +234,10 @@ Use an Astro content collection validated at build time:
 title: "..."
 description: "..."
 pubDate: 2026-08-16
-category: release-notes # release-notes | security-advisory | product-update
 draft: false
 ```
 
-- `/blog/` lists published posts newest first and filters by the three fixed
-  categories.
+- `/blog/` lists published posts newest first.
 - `/blog/<slug>/` is a static post page with canonical metadata.
 - `/rss.xml` contains published posts only.
 - `draft: true` posts are excluded from the index, feeds, sitemap, and
@@ -267,11 +265,10 @@ draft: false
    URLs, page titles/descriptions, sitemap, and `robots.txt`. The production
    hostname is indexable; Worker preview and `*.workers.dev` hosts are
    explicitly `noindex`.
-5. Create screenshots from a dedicated temporary demo server/database with
-   synthetic organization, repository, PR, user, device, and branding labels.
-   Capture only approved dashboard metadata views at desktop and mobile sizes.
-   Add a reproducible screenshot script/fixture and an automated text scan for
-   prohibited terms/known sentinels before committing the image files.
+5. Do not capture or commit dashboard screenshots. The landing page shows
+   labelled, code-native synthetic previews of repository readiness, device
+   access, and branding/settings. Those previews are not represented as live
+   product captures.
 
 ## Security, privacy, and caching
 
@@ -401,8 +398,9 @@ dependencies are required.
    CTA links.
 3. Add the exact cost and scope disclosures, Apache-2.0/GitHub/Security links,
    metadata, and accessibility semantics.
-4. Capture approved demo screenshots from synthetic data and integrate them
-   with descriptive captions/alt text.
+4. Product proof on the landing page uses labelled, code-native synthetic
+   dashboard previews. Captured dashboard screenshots are out of scope and
+   will not be used.
 
 **Exit:** the landing page is responsive, accessible, truthful to the product
 contract, and contains no live customer/app data or secret-like material.
@@ -426,9 +424,9 @@ safe daily workflow without relying on the legacy short docs.
 ### W4 — Blog and editorial guardrails
 
 1. Implement the validated blog collection, published/draft filtering,
-   category views, post layout, archive, canonical metadata, and RSS.
-2. Add one representative post for each permitted category, using only public,
-   non-sensitive information.
+   post layout, archive, canonical metadata, and RSS.
+2. Add public, non-sensitive posts using only information that can appear on
+   the static site.
 3. Add a short contributor guide for frontmatter, drafts, review expectations,
    release-note links, and security-advisory coordination through `SECURITY.md`.
 
@@ -473,7 +471,8 @@ provably unchanged.
       repository's actual contract and do not overclaim.
 - [ ] The supplied logo is locally served; no third-party font, image,
       analytics, or script is required.
-- [ ] All screenshots are synthetic and pass the sensitive-data scan.
+- [x] Dashboard screenshots are not used. Landing proof is synthetic UI
+      preview markup, not captured instance imagery.
 - [ ] CSP, security headers, cache policy, accessibility checks, and SEO
       metadata pass against the generated production output.
 - [ ] PR previews are non-indexable; `main` deployment is automatic only
@@ -490,3 +489,5 @@ provably unchanged.
 - Moving the product application to `app.local.env.best` and repurposing the
   apex `local.env.best` as marketing is explicitly out of scope for this
   release.
+- Captured dashboard screenshots for the public site are out of scope. The
+  landing page keeps synthetic, code-native product previews instead.

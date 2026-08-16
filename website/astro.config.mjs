@@ -1,6 +1,28 @@
 import { defineConfig } from "astro/config";
+import { unified } from "@astrojs/markdown-remark";
 import sitemap from "@astrojs/sitemap";
 import starlight from "@astrojs/starlight";
+import rehypeMermaid from "rehype-mermaid";
+
+function wrapMermaidDiagrams() {
+  const wrap = (node) => {
+    if (!node?.children) return;
+    for (let index = 0; index < node.children.length; index += 1) {
+      const child = node.children[index];
+      if (child.type === "element" && child.tagName === "svg" && String(child.properties?.id ?? "").startsWith("mermaid")) {
+        node.children[index] = {
+          type: "element",
+          tagName: "figure",
+          properties: { className: ["diagram"] },
+          children: [child]
+        };
+      } else {
+        wrap(child);
+      }
+    }
+  };
+  return (tree) => wrap(tree);
+}
 
 export default defineConfig({
   site: "https://www.local.env.best",
@@ -8,11 +30,36 @@ export default defineConfig({
   build: {
     inlineStylesheets: "never"
   },
+  markdown: {
+    syntaxHighlight: {
+      type: "shiki",
+      excludeLangs: ["mermaid"]
+    },
+    processor: unified({
+      rehypePlugins: [
+        [rehypeMermaid, {
+          colorScheme: "dark",
+          mermaidConfig: {
+            theme: "dark",
+            fontFamily: "Figtree Variable, ui-sans-serif, system-ui, sans-serif",
+            flowchart: { htmlLabels: false }
+          },
+          strategy: "inline-svg"
+        }],
+        wrapMermaidDiagrams
+      ]
+    })
+  },
   integrations: [
     sitemap(),
     starlight({
       title: "local.env documentation",
       disable404Route: true,
+      customCss: ["./src/styles/docs.css"],
+      components: {
+        ThemeProvider: "./src/components/starlight/ThemeProvider.astro",
+        ThemeSelect: "./src/components/starlight/ThemeSelect.astro"
+      },
       editLink: {
         baseUrl: "https://github.com/mithatakbulut/local.env/edit/main/website/"
       },
