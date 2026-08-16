@@ -9,5 +9,11 @@ docs/*
 !docs/cli.md
 !docs/dashboard-ui-plan.md
 !docs/installation.md
+!docs/public-website-plan.md
 !docs/security-model.md
 frontend/node_modules/
+website/node_modules/
+website/.astro/
+website/.wrangler/
+website/dist/
+.DS_Store
