@@ -1,0 +1,13 @@
+{
+  // Workers Builds defaults to the repository root. Keep this file aligned
+  // with website/wrangler.jsonc (same Worker name and asset handling).
+  "name": "localenv-public-site",
+  "compatibility_date": "2026-08-15",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./website/dist",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}
+
