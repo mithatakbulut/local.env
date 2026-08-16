@@ -1,13 +1,19 @@
 {
-  // Workers Builds defaults to the repository root. Keep this file aligned
-  // with website/wrangler.jsonc (same Worker name and asset handling).
+  // Workers Builds defaults to the repository root and currently runs
+  // `npx wrangler versions upload` with no separate build command.
+  // Keep this file aligned with website/wrangler.jsonc.
   "name": "localenv-public-site",
   "compatibility_date": "2026-08-15",
   "workers_dev": true,
+  "build": {
+    "command": "npm ci && npx playwright install --with-deps chromium && npm run build",
+    "cwd": "website"
+  },
   "assets": {
     "directory": "./website/dist",
     "html_handling": "auto-trailing-slash",
     "not_found_handling": "404-page"
   }
 }
+
 
