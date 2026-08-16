@@ -6,7 +6,7 @@
   "compatibility_date": "2026-08-15",
   "workers_dev": true,
   "build": {
-    "command": "npm ci && npx playwright install --with-deps chromium && npm run build",
+    "command": "npm ci && npm run build",
     "cwd": "website"
   },
   "assets": {
