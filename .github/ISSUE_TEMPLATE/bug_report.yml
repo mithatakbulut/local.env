@@ -1,0 +1,119 @@
+name: Bug report
+description: Report a reproducible problem with local.env.
+title: "[Bug]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please do not include real secrets, tokens, repository keys, credentials, or private environment values.
+
+        If this may be a security vulnerability, stop here and follow `SECURITY.md` instead of opening a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: local.env version
+      description: Release tag or commit SHA where you observed the problem.
+      placeholder: v1.1.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - CLI
+        - Server / API
+        - Dashboard
+        - GitHub integration / PR readiness
+        - Repository contract / localenv.yaml
+        - Self-hosting / deployment
+        - Website / documentation
+        - Release artifacts
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Include OS and architecture when relevant.
+      placeholder: macOS 15 arm64 / Ubuntu 24.04 amd64
+    validations:
+      required: true
+
+  - type: input
+    id: installation
+    attributes:
+      label: Installation or deployment method
+      description: How did you install the CLI or run the server?
+      placeholder: Release archive, Docker, built from source, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect local.env to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reproducible sequence using placeholder values only.
+      placeholder: |
+        1. Configure ...
+        2. Run `localenv ...`
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract
+    attributes:
+      label: Relevant non-secret configuration
+      description: Paste a minimal `localenv.yaml`, schema key names, or other non-secret configuration if it helps reproduce the issue.
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized output or logs
+      description: Include only output you have checked for secrets and private data.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that may help explain the problem.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I have removed all real secrets, tokens, credentials, repository keys, and private environment values from this report.
+          required: true
+        - label: I have checked that this is not a security vulnerability requiring private disclosure under `SECURITY.md`.
+          required: true
