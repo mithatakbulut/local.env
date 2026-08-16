@@ -29,10 +29,18 @@ test("build emits the public static routes and custom 404", () => {
 
 test("the static header policy is copied to deploy output", () => {
   const headers = readFileSync(output("_headers"), "utf8");
-  for (const policy of ["Content-Security-Policy", "base-uri 'self'", "object-src 'none'", "frame-ancestors 'none'", "X-Content-Type-Options: nosniff", "Referrer-Policy", "Permissions-Policy", "max-age=31536000, immutable", "/_localenv/*"]) {
+  for (const policy of ["Content-Security-Policy", "base-uri 'self'", "object-src 'none'", "frame-ancestors 'none'", "X-Content-Type-Options: nosniff", "Referrer-Policy", "Permissions-Policy", "max-age=31536000, immutable", "/_localenv/*", "X-Robots-Tag: noindex"]) {
     assert.match(headers, new RegExp(policy.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
   }
-  assert.doesNotMatch(headers, /unsafe-inline|https?:\/\//);
+  assert.doesNotMatch(headers, /unsafe-inline/);
+  assert.match(headers, /https:\/\/:version\.:subdomain\.workers\.dev\/\*/);
+  assert.match(headers, /https:\/\/localenv-public-site\.:subdomain\.workers\.dev\/\*/);
+  const remoteHosts = [...headers.matchAll(/https?:\/\/[^\s]+/g)].map((match) => match[0]);
+  assert.equal(
+    remoteHosts.every((host) => host.endsWith(".workers.dev/*")),
+    true,
+    "the only absolute hosts in _headers are workers.dev preview matchers"
+  );
 });
 
 test("generated static HTML has no remote runtime dependency", () => {
