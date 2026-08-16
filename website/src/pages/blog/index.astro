@@ -1,12 +1,24 @@
 ---
-import { getCollection } from "astro:content";
 import BaseLayout from "../../layouts/BaseLayout.astro";
+import { postPath, publishedPosts } from "../../lib/blog";
 
-const posts = (await getCollection("blog", ({ data }) => !data.draft)).sort((a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf());
+const posts = await publishedPosts();
 ---
 
-<BaseLayout title="Blog — local.env" description="Release notes, security advisories, and product updates for local.env.">
+<BaseLayout title="Blog | local.env" description="Notes about local.env: how the product works, and why it is shaped the way it is.">
   <p class="eyebrow">Blog</p>
-  <h1>Product updates</h1>
-  {posts.length === 0 ? <p class="lede">Published updates will appear here.</p> : <div class="card-grid">{posts.map((post) => <article class="card"><p>{post.data.category}</p><h2><a href={`/blog/${post.id}/`}>{post.data.title}</a></h2><p>{post.data.description}</p></article>)}</div>}
+  <h1>Notes</h1>
+  <p class="lede">Short writing about the product and why it is shaped the way it is.</p>
+  {posts.length === 0 ? <p>Published updates will appear here.</p> : (
+    <div class="card-grid">
+      {posts.map((post) => (
+        <article class="card">
+          <h2><a href={postPath(post)}>{post.data.title}</a></h2>
+          <p>{post.data.description}</p>
+          <time datetime={post.data.pubDate.toISOString()}>{post.data.pubDate.toLocaleDateString("en", { dateStyle: "medium", timeZone: "UTC" })}</time>
+        </article>
+      ))}
+    </div>
+  )}
+  <p class="blog-guide">Editorial rules for drafts and advisories are in the <a class="text-link" href="https://github.com/mithatakbulut/local.env/blob/main/website/CONTRIBUTING.md">website contributor guide</a>.</p>
 </BaseLayout>

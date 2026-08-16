@@ -42,10 +42,15 @@ for (const file of files) {
     return `<script${attributes} src="${source}"></script>`;
   });
 
-  html = await replaceAsync(html, /<style(\s[^>]*)?>([\s\S]*?)<\/style>/gi, async (_match, attributes = "", content) => {
-    const source = await writeAsset("css", content);
-    return `<link rel="stylesheet"${attributes} href="${source}">`;
+  const extractedStyles = [];
+  html = await replaceAsync(html, /<style(\s[^>]*)?>([\s\S]*?)<\/style>/gi, async (_match, _attributes = "", content) => {
+    extractedStyles.push(await writeAsset("css", content));
+    return "";
   });
+  if (extractedStyles.length > 0) {
+    const links = extractedStyles.map((source) => `<link rel="stylesheet" href="${source}">`).join("");
+    html = html.includes("</head>") ? html.replace("</head>", `${links}</head>`) : `${links}${html}`;
+  }
 
   html = html.replace(/\sstyle=(['"])(.*?)\1/gi, (_match, _quote, declarations) => {
     const className = `localenv-style-${digest(declarations)}`;

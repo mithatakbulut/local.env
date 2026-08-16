@@ -54,7 +54,7 @@ LOCALENV_FAVICON_URL=https://assets.example.test/localenv-favicon.png
 ## Verify
 
 Load `/settings` while signed in and confirm the branding preview shows only
-the configured name and validated logo/favicon URLs—never secret values.
+the configured name and validated logo/favicon URLs, never secret values.
 
 ## Next step
 

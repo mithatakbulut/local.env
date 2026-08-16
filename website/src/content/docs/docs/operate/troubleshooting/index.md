@@ -34,7 +34,7 @@ curl --fail https://example.localenv.test/healthz
 curl --fail https://example.localenv.test/readyz
 ```
 
-Share command output that includes only metadata—never managed values, OAuth
+Share command output that includes only metadata, never managed values, OAuth
 secrets, session tokens, or private keys.
 
 ## Dashboard access denied

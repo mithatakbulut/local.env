@@ -34,7 +34,7 @@ Alternatively set a single PR-scoped key:
 localenv set EXAMPLE_KEY --pr NUMBER
 ```
 
-Use `EXAMPLE_KEY` as a declared schema key name—not a real secret value.
+Use `EXAMPLE_KEY` as a declared schema key name, not a real secret value.
 
 3. Refresh GitHub and confirm the readiness check turns green when all
    requirements are satisfied.

@@ -19,7 +19,7 @@ docker exec localenv localenv-server backup \
 ```
 
 The archive contains an online SQLite snapshot and credential files when
-present. It holds ciphertext and metadata—not managed secret plaintext or a
+present. It holds ciphertext and metadata, not managed secret plaintext or a
 plaintext repository encryption key.
 
 ## Restore

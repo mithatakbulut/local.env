@@ -37,7 +37,7 @@ https://example.localenv.test/auth/github/callback
 | `LOCALENV_GITHUB_OAUTH_CLIENT_SECRET` | Bootstrap OAuth App client secret |
 | `LOCALENV_GITHUB_APP_CREDENTIALS_ENCRYPTION_KEY` | Encrypts generated GitHub App credentials at rest |
 
-Example shape only — use values from your secret manager, not from docs:
+Example shape only. Use values from your secret manager, not from docs:
 
 ```bash
 --env LOCALENV_GITHUB_OAUTH_CLIENT_ID=example-client-id \
