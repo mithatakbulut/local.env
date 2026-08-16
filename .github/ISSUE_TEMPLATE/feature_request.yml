@@ -1,0 +1,84 @@
+name: Feature request
+description: Propose an improvement that fits local.env's local-development scope.
+title: "[Feature]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        local.env deliberately focuses on synchronizing **local-development** environment requirements with code changes.
+
+        It is not intended to become a production/staging/CI secret manager, password manager, cloud vault, or browser-based plaintext secret editor. Requests that cross those boundaries are unlikely to be accepted.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete developer or operator problem are you trying to solve?
+      placeholder: Describe the workflow today and where it becomes awkward, unsafe, or repetitive.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should local.env do differently?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI workflow
+        - GitHub / pull-request readiness
+        - Repository contract
+        - Device access / key rotation
+        - Self-hosting / operations
+        - Dashboard metadata UX
+        - Website / documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Example workflow
+      description: Show what the user experience would look like, including commands or PR behavior when useful.
+      placeholder: |
+        1. Developer ...
+        2. local.env ...
+        3. Team ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: How do you solve this today? Why is that insufficient?
+    validations:
+      required: false
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Security or trust-boundary impact
+      description: Could this change where plaintext is handled, what the server stores, GitHub permissions, device authorization, or filesystem writes? If not, say "None expected."
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This proposal is for local-development environment coordination, not production, staging, or CI secret management.
+          required: true
+        - label: This proposal does not require the dashboard to accept or display managed plaintext secrets.
+          required: true
+        - label: I understand that proposals expanding the documented security boundary should be discussed before implementation.
+          required: true
