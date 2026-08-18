@@ -1,6 +1,6 @@
 ---
 title: Documentation
-description: Choose an administrator or developer journey to get started with local.env.
+description: Choose an administrator, developer, or coding-agent journey to get started with local.env.
 ---
 
 local.env is Apache-2.0 licensed, self-hosted software for keeping a team's
@@ -27,6 +27,14 @@ PR requirements, and sync safely to a local dotenv target.
 
 [Start joining →](./join-an-instance/prerequisites/)
 
+### I use a coding agent
+
+Install the local.env plugin once in Claude Code, Codex, or Cursor, then ask the
+agent to handle local.env workflows from the repository you are already working
+in. You do not copy skill files into each project.
+
+[Set up coding agents →](./use-localenv/coding-agents/)
+
 ## Product overview
 
 Read the [overview](./overview/) for the workflow, security boundary, and what
@@ -34,6 +42,7 @@ local.env deliberately does not do.
 
 ## Reference material
 
+- [Use local.env with coding agents](./use-localenv/coding-agents/)
 - [Security model](./security/security-model/)
 - [CLI commands](./reference/cli-commands/)
 - [Environment variables](./reference/environment-variables/)
