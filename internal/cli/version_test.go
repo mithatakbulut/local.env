@@ -2,12 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCompareRelease(t *testing.T) {
@@ -158,6 +160,50 @@ func TestUpdateNoticeUsesCachedReleaseWithoutRefetching(t *testing.T) {
 	}
 }
 
+func TestUpdateNoticeBacksOffAfterFailedLookup(t *testing.T) {
+	isolateUpdateState(t)
+	updateNoticeTTYOnly = false
+	Version = "v1.1.0"
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Error(w, "unavailable", http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+	original := latestReleaseAPI
+	latestReleaseAPI = server.URL
+	t.Cleanup(func() { latestReleaseAPI = original })
+
+	var first, second bytes.Buffer
+	notifyUpdate(&first)
+	notifyUpdate(&second)
+	if hits != 1 {
+		t.Fatalf("lookups = %d, want 1", hits)
+	}
+	if first.Len() != 0 || second.Len() != 0 {
+		t.Fatalf("first=%q second=%q", first.String(), second.String())
+	}
+}
+
+func TestLookupLatestReleaseAllowsLargeGitHubPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"body":"`+strings.Repeat("x", 40<<10)+`","tag_name":"v1.1.3","html_url":"https://github.com/`+githubReleasesRepo+`/releases/tag/v1.1.3"}`)
+	}))
+	t.Cleanup(server.Close)
+	original := latestReleaseAPI
+	latestReleaseAPI = server.URL
+	t.Cleanup(func() { latestReleaseAPI = original })
+
+	release, err := lookupLatestRelease(context.Background(), time.Second)
+	if err != nil {
+		t.Fatalf("lookup failed: %v", err)
+	}
+	if release.TagName != "v1.1.3" {
+		t.Fatalf("tag = %q", release.TagName)
+	}
+}
+
 func TestUpdateNoticeDisabledByEnv(t *testing.T) {
 	isolateUpdateState(t)
 	updateNoticeTTYOnly = false
@@ -179,11 +225,13 @@ func isolateUpdateState(t *testing.T) {
 	originalPath := updateStatePath
 	originalTTY := updateNoticeTTYOnly
 	originalVersion := Version
+	originalFailureRetryInterval := updateFailureRetryInterval
 	updateStatePath = filepath.Join(t.TempDir(), "update-check.json")
 	t.Cleanup(func() {
 		updateStatePath = originalPath
 		updateNoticeTTYOnly = originalTTY
 		Version = originalVersion
+		updateFailureRetryInterval = originalFailureRetryInterval
 	})
 }
 
