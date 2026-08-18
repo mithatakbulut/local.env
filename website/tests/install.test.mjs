@@ -16,7 +16,8 @@ test("build emits a syntax-valid verified installer", () => {
 
   const installer = readFileSync(installerPath, "utf8");
   for (const required of [
-    "https://github.com/mithatakbulut/local.env/releases/latest",
+    'REPO="mithatakbulut/local.env"',
+    "/releases/latest",
     "checksums.txt.bundle",
     "cosign verify-blob",
     "--certificate-identity",
@@ -27,7 +28,7 @@ test("build emits a syntax-valid verified installer", () => {
     "LOCALENV_VERSION",
     ".local/bin"
   ]) {
-    assert.match(installer, new RegExp(required.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
+    assert.equal(installer.includes(required), true, `installer contains ${required}`);
   }
 
   assert.doesNotMatch(installer, /\bsudo\b/);
