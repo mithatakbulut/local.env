@@ -61,11 +61,44 @@ func TestApplySnapshotPreservesDeveloperContentWrites0600AndDryRunDoesNotWrite(t
 	if err := os.Chmod(target, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := applySnapshot(root, decryptedSnapshot{".env.local": {"DATABASE_URL": []byte("non-secret-test-sentinel")}}, false, &bytes.Buffer{}, &errOut); err != nil {
+	out.Reset()
+	if err := applySnapshot(root, decryptedSnapshot{".env.local": {"DATABASE_URL": []byte("non-secret-test-sentinel")}}, false, &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Stat(target); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("unchanged target permissions = %v, %v", info.Mode().Perm(), err)
+	}
+	if !strings.Contains(out.String(), ".env.local: set mode 0600") || !strings.Contains(out.String(), ".env.local: already up to date") {
+		t.Fatalf("unchanged target output = %q", out.String())
+	}
+}
+
+func TestEnsureLocalTargetMode0600FixesPermissiveExistingFile(t *testing.T) {
+	root := t.TempDir()
+	target := ".env.local"
+	path := filepath.Join(root, target)
+	if err := os.WriteFile(path, []byte("DATABASE_URL=example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := ensureLocalTargetMode0600(root, target)
+	if err != nil || !changed {
+		t.Fatalf("first tighten = changed %v, err %v", changed, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("target permissions = %v, %v", info.Mode().Perm(), err)
+	}
+	changed, err = ensureLocalTargetMode0600(root, target)
+	if err != nil || changed {
+		t.Fatalf("second tighten = changed %v, err %v", changed, err)
+	}
+}
+
+func TestEnsureLocalTargetMode0600NoopsWhenTargetMissing(t *testing.T) {
+	root := t.TempDir()
+	changed, err := ensureLocalTargetMode0600(root, ".env.local")
+	if err != nil || changed {
+		t.Fatalf("missing target = changed %v, err %v", changed, err)
 	}
 }
 
@@ -403,8 +436,137 @@ func TestDoctorChecksRuntimePrerequisites(t *testing.T) {
 	}
 	out.Reset()
 	code = runDoctor([]string{"--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
-	if code != 1 || !strings.Contains(out.String(), "FAIL target .env.local") {
+	if code != 1 || !strings.Contains(out.String(), "FAIL target .env.local") || !strings.Contains(out.String(), "must be mode 0600; run localenv import or localenv sync") {
 		t.Fatalf("doctor unsafe target = code %d, out %q", code, out.String())
+	}
+}
+
+func TestDoctorTargetSeparatesIgnoreAndModeFailures(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "-q", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".env.local"), []byte("DATABASE_URL=example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ok, detail := doctorTarget(root, ".env.local")
+	if ok || detail != "must be Git-ignored" {
+		t.Fatalf("unignored = %v %q", ok, detail)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".env.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ok, detail = doctorTarget(root, ".env.local")
+	if ok || detail != "must be mode 0600; run localenv import or localenv sync" {
+		t.Fatalf("permissive = %v %q", ok, detail)
+	}
+}
+
+func TestImportTightensPermissiveTargetThenDoctorPasses(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "-q", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", root, "remote", "add", "origin", "https://github.com/acme/api.git").CombinedOutput(); err != nil {
+		t.Fatalf("git remote: %v: %s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(root, "localenv.yaml"), []byte("version: 1\nfiles:\n  - schema: .env.example\n    target: .env.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".env.example"), []byte("DATABASE_URL=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".env.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial := []byte("DATABASE_URL=non-secret-import-sentinel\n")
+	if err := os.WriteFile(filepath.Join(root, ".env.local"), initial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rek := []byte("non-secret-test-rek-sentinel-000")
+	wrapped, err := cryptokit.WrapREK(rek, identity.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileID := pranalysis.FileID(17, ".env.example", ".env.local")
+	imported := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-session" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/repos/acme/api/secrets/"+fileID+"/DATABASE_URL":
+			imported++
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v1/repos/acme/api/snapshot":
+			_ = json.NewEncoder(w).Encode(apiRepositorySnapshot{Repository: apiRepositoryCryptoState{InstanceID: "edb7f4f6-4bc5-4eca-91cd-bfde8588e2a9", GitHubRepoID: 17, Owner: "acme", Name: "api", ActiveKeyEpoch: 1, Initialized: true}, WrappedREK: wrapped})
+		case r.URL.Path == "/api/v1/me":
+			_ = json.NewEncoder(w).Encode(apiMe{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	credentials := &fileStore{path: filepath.Join(t.TempDir(), "credentials.json")}
+	if err := credentials.Set("last-instance", server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentials.Set(sessionKey(server.URL), "test-session"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := json.Marshal(struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Identity string `json:"identity"`
+	}{ID: "device-import", Name: "import device", Identity: identity.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := credentials.Set(identityKey(server.URL), string(saved)); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+
+	var out, errOut bytes.Buffer
+	code := runDoctor([]string{"--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
+	if code != 1 || !strings.Contains(out.String(), "must be mode 0600; run localenv import or localenv sync") {
+		t.Fatalf("doctor before import = code %d, out %q, err %q", code, out.String(), errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	code = runImport([]string{".env.local", "--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
+	if code != 0 || imported != 1 || !strings.Contains(out.String(), "Encrypted and imported 1 declared local value(s).") || !strings.Contains(out.String(), "Set .env.local to mode 0600.") || strings.Contains(out.String()+errOut.String(), "non-secret-import-sentinel") {
+		t.Fatalf("import = code %d imported %d out %q err %q", code, imported, out.String(), errOut.String())
+	}
+	info, err := os.Stat(filepath.Join(root, ".env.local"))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("target permissions = %v, %v", info.Mode().Perm(), err)
+	}
+	after, err := os.ReadFile(filepath.Join(root, ".env.local"))
+	if err != nil || !bytes.Equal(after, initial) {
+		t.Fatalf("import rewrote local content: %q", after)
+	}
+	out.Reset()
+	errOut.Reset()
+	code = runDoctor([]string{"--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
+	if code != 0 || !strings.Contains(out.String(), "OK target .env.local") {
+		t.Fatalf("doctor after import = code %d, out %q, err %q", code, out.String(), errOut.String())
 	}
 }
 

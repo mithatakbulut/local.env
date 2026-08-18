@@ -23,6 +23,7 @@ support tickets.
 | Login loop fails | Confirm instance URL matches `LOCALENV_PUBLIC_URL` exactly |
 | Snapshot denied | Verify GitHub write access and active device approval |
 | Decryption failure | Run `localenv doctor`; tampered ciphertext fails authenticated decryption |
+| Doctor FAIL target mode `0600` | Run `localenv import FILE` or `localenv sync`. Editors often create `.env` files as `0644`; the CLI tightens the declared target. |
 | Pending access | An authorized device must approve the request code |
 
 ## Safe diagnostics
