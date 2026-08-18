@@ -1,0 +1,18 @@
+{
+  "name": "localenv",
+  "owner": {
+    "name": "Mithat Akbulut"
+  },
+  "metadata": {
+    "description": "Agent skills for local.env developer and administrator workflows",
+    "version": "0.1.0",
+    "pluginRoot": "plugins"
+  },
+  "plugins": [
+    {
+      "name": "localenv",
+      "source": "localenv",
+      "description": "Use and administer local.env safely from coding agents"
+    }
+  ]
+}
