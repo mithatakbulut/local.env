@@ -35,9 +35,10 @@ test("build emits a syntax-valid verified installer", () => {
   assert.doesNotMatch(installer, /http:\/\//);
 });
 
-test("install documentation points developers at the canonical installer", () => {
+test("install documentation points developers at the public installer origin", () => {
   const docs = readFileSync(output("docs/join-an-instance/install-the-cli/index.html"), "utf8");
-  assert.match(docs, /curl -fsSL https:\/\/local\.env\.best\/install\.sh \| sh/);
+  assert.match(docs, /curl -fsSL https:\/\/www\.local\.env\.best\/install\.sh \| sh/);
+  assert.doesNotMatch(docs, /curl -fsSL https:\/\/local\.env\.best\/install\.sh/);
   assert.match(docs, /Sigstore/);
   assert.match(docs, /LOCALENV_INSTALL_DIR/);
   assert.match(docs, /LOCALENV_VERSION/);

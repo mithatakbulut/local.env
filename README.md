@@ -15,7 +15,7 @@ Self-hosted. Apache-2.0 licensed. Plaintext managed values stay on developer mac
 With [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) on `PATH`:
 
 ```bash
-curl -fsSL https://local.env.best/install.sh | sh
+curl -fsSL https://www.local.env.best/install.sh | sh
 ```
 
 The installer detects macOS/Linux and amd64/arm64, verifies the signed release checksum manifest and archive digest, and installs to `~/.local/bin/localenv` by default. See the [CLI installation guide](https://www.local.env.best/docs/join-an-instance/install-the-cli/) for verification details, version pinning, and custom install directories.
