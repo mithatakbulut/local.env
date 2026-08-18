@@ -258,6 +258,18 @@ func TestMaskedValueShowsOnlyAsterisksAndHandlesBackspace(t *testing.T) {
 	}
 }
 
+func TestSecretPromptLabelNamesTheKey(t *testing.T) {
+	if got, want := secretPromptLabel("REDIS_URL", ".env.local"), ".env.local REDIS_URL="; got != want {
+		t.Fatalf("prompt with file = %q, want %q", got, want)
+	}
+	if got, want := secretPromptLabel("DATABASE_URL", ""), "DATABASE_URL="; got != want {
+		t.Fatalf("prompt without file = %q, want %q", got, want)
+	}
+	if first, second := secretPromptLabel("API_KEY", ".env.local"), secretPromptLabel("REDIS_URL", ".env.local"); first == second {
+		t.Fatalf("prompts for different keys were identical: %q", first)
+	}
+}
+
 func TestStyledOutputPreservesPlainTextWithoutTerminalColor(t *testing.T) {
 	var output bytes.Buffer
 	writer := styledOutput{writer: &output}
