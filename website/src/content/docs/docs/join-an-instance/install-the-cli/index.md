@@ -26,8 +26,12 @@ the matching GitHub release, verifies it, and installs the CLI to
 `~/.local/bin/localenv` by default.
 
 ```bash
-curl -fsSL https://local.env.best/install.sh | sh
+curl -fsSL https://www.local.env.best/install.sh | sh
 ```
+
+The installer is served by the public documentation Worker at
+`www.local.env.best`. The apex `local.env.best` hostname is reserved for the
+local.env application instance and is not the installer origin.
 
 The installer does not use `sudo` and does not modify your shell profile. If
 `~/.local/bin` is not already on `PATH`, it tells you to add it.
@@ -35,7 +39,7 @@ The installer does not use `sudo` and does not modify your shell profile. If
 Prefer to inspect the script first?
 
 ```bash
-curl -fsSL https://local.env.best/install.sh -o install-localenv.sh
+curl -fsSL https://www.local.env.best/install.sh -o install-localenv.sh
 less install-localenv.sh
 sh install-localenv.sh
 ```
@@ -63,13 +67,13 @@ new binary.
 Install a specific release:
 
 ```bash
-curl -fsSL https://local.env.best/install.sh | LOCALENV_VERSION=v1.2.3 sh
+curl -fsSL https://www.local.env.best/install.sh | LOCALENV_VERSION=v1.2.3 sh
 ```
 
 Choose another writable directory:
 
 ```bash
-curl -fsSL https://local.env.best/install.sh | LOCALENV_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://www.local.env.best/install.sh | LOCALENV_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Self-update needs write access to the installed executable's directory. A
