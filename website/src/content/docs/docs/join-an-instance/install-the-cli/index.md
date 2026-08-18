@@ -1,105 +1,82 @@
 ---
 title: Install the CLI
-description: Install and keep the localenv CLI up to date on your development machine.
+description: Install a verified localenv release on macOS or Linux.
 ---
 
 ## Goal
 
-Install a verified `localenv` release and keep it up to date without replacing
-an installed binary before verification succeeds.
+Install the `localenv` CLI without manually choosing a release archive.
 
 ## Preconditions
 
 - Completed [join prerequisites](../prerequisites/).
-- `cosign` is available on `PATH` if you want to use verified self-update.
+- `curl`, `tar`, and a SHA-256 tool (`shasum` on macOS or `sha256sum` on Linux).
+- [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) on `PATH` for release signature verification.
 
-## Supported platforms
-
-Release archives are published for:
-
-- macOS on arm64 and amd64
-- Linux on arm64 and amd64
-
-## First install
-
-Download the release archive for your platform from the local.env GitHub
-Releases page. Verify the published checksum and Sigstore bundle before placing
-the binary on your `PATH`.
-
-If you want `localenv` to update itself later, install it somewhere your user
-can write to. For example:
+On macOS with Homebrew:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-install -m 0755 localenv "$HOME/.local/bin/localenv"
-export PATH="$HOME/.local/bin:$PATH"
-localenv --version
+brew install cosign
 ```
 
-Add `$HOME/.local/bin` to your shell's `PATH` permanently if it is not already
-there.
+## Install
 
-A system-wide install also works:
+The recommended installer detects macOS or Linux and amd64 or arm64, downloads
+the matching GitHub release, verifies it, and installs the CLI to
+`~/.local/bin/localenv` by default.
 
 ```bash
-sudo install -m 0755 localenv /usr/local/bin/localenv
+curl -fsSL https://local.env.best/install.sh | sh
 ```
 
-But a root-owned binary may not be replaceable by a normal user during
-self-update. In that case, install the new release manually with the required
-permissions or move the CLI to a user-writable directory.
+The installer does not use `sudo` and does not modify your shell profile. If
+`~/.local/bin` is not already on `PATH`, it tells you to add it.
 
-## Check for updates
-
-`--version` is intentionally script-friendly and prints only the installed
-build version:
+Prefer to inspect the script first?
 
 ```bash
-localenv --version
+curl -fsSL https://local.env.best/install.sh -o install-localenv.sh
+less install-localenv.sh
+sh install-localenv.sh
 ```
 
-For a human-readable update check:
+## What the installer verifies
 
-```bash
-localenv version
-```
+Before anything is placed on `PATH`, the installer:
 
-Interactive commands also check for a newer release at most once every 24
-hours. When one is available, the terminal can show:
-
-```text
-Update available: v1.1.3 → v1.2.0
-Update now? [y/N]
-```
-
-Answering `n` or pressing Enter keeps the current version and suppresses that
-release notice for 24 hours.
-
-## Update explicitly
-
-You can update without waiting for the prompt:
-
-```bash
-localenv version --update
-```
-
-Before replacing the current executable, localenv:
-
-1. downloads `checksums.txt` and its Sigstore bundle,
-2. verifies the bundle against the exact local.env GitHub Actions release
-   workflow identity,
-3. reads the expected SHA-256 for your platform archive from the verified
+1. resolves a stable `vX.Y.Z` GitHub release,
+2. downloads `checksums.txt` and `checksums.txt.bundle`,
+3. verifies the Sigstore bundle against the exact local.env GitHub Actions
+   release workflow identity,
+4. reads the expected SHA-256 for your platform archive from that verified
    manifest,
-4. downloads the archive and verifies its digest, and
-5. replaces the current executable only after every verification succeeds.
+5. downloads the archive and verifies its SHA-256,
+6. extracts only the `localenv` binary,
+7. checks that the binary reports the expected release version, and
+8. atomically installs it into the selected user-writable directory.
 
-Automatic update requires `cosign` on `PATH`. If signature verification,
-checksum verification, download, extraction, or executable replacement fails,
-the installed CLI is left unchanged.
+If any verification step fails, the installer exits without installing the
+new binary.
 
-To disable background update checks and prompts while keeping explicit
-`localenv version --update` available, set `LOCALENV_NO_UPDATE_NOTIFIER` to any
-non-empty value.
+## Choose a version or install directory
+
+Install a specific release:
+
+```bash
+curl -fsSL https://local.env.best/install.sh | LOCALENV_VERSION=v1.2.3 sh
+```
+
+Choose another writable directory:
+
+```bash
+curl -fsSL https://local.env.best/install.sh | LOCALENV_INSTALL_DIR="$HOME/bin" sh
+```
+
+Self-update needs write access to the installed executable's directory. A
+user-owned directory such as `~/.local/bin` lets later `Update now? [y/N]`
+prompts replace the CLI without elevation. If your organization installs
+`localenv` into a root-owned directory such as `/usr/local/bin`, use your
+package-management process for upgrades instead.
 
 ## Verify installation
 
@@ -108,14 +85,29 @@ localenv --version
 localenv version
 ```
 
-The first command should print the installed release version. The second should
-report whether it is current.
+`localenv --version` prints only the installed version. `localenv version`
+also checks whether a newer GitHub release is available.
+
+After the first install, interactive commands can offer:
+
+```text
+Update available: v1.2.3 → v1.2.4
+Update now? [y/N]
+```
+
+You can also update explicitly:
+
+```bash
+localenv version --update
+```
+
+See the [CLI command reference](../../reference/cli-commands/) for update
+behavior and how to disable update prompts.
 
 ## Expected result
 
-The `localenv` command is available in your shell, its release can be verified,
-and supported installations can update through the CLI without bypassing
-release signature or checksum verification.
+The `localenv` command is available in your shell from a verified release and
+can update itself later when installed in a user-writable directory.
 
 ## Next step
 
