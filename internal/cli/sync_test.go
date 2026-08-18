@@ -415,6 +415,9 @@ func TestRunReturnsChildExitStatusWithoutExposingSnapshotValue(t *testing.T) {
 func TestDoctorChecksRuntimePrerequisites(t *testing.T) {
 	root, server, credentials := runtimeTestRepository(t)
 	defer server.Close()
+	isolateUpdateState(t)
+	Version = "v1.1.3"
+	stubLatestRelease(t, "v1.1.3")
 	original, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -428,7 +431,7 @@ func TestDoctorChecksRuntimePrerequisites(t *testing.T) {
 	}
 	var out, errOut bytes.Buffer
 	code := runDoctor([]string{"--instance", server.URL, "--credential-file", credentials.path}, &out, &errOut)
-	if code != 0 || errOut.Len() != 0 || !strings.Contains(out.String(), "OK instance reachable") || !strings.Contains(out.String(), "OK GitHub authentication") || !strings.Contains(out.String(), "OK repository recognized") || !strings.Contains(out.String(), "OK localenv.yaml") || !strings.Contains(out.String(), "OK target .env.local") || !strings.Contains(out.String(), "OK device key") || !strings.Contains(out.String(), "OK repository encryption key") || strings.Contains(out.String(), "runtime-test-sentinel") {
+	if code != 0 || errOut.Len() != 0 || !strings.Contains(out.String(), "OK cli version") || !strings.Contains(out.String(), "OK instance reachable") || !strings.Contains(out.String(), "OK GitHub authentication") || !strings.Contains(out.String(), "OK repository recognized") || !strings.Contains(out.String(), "OK localenv.yaml") || !strings.Contains(out.String(), "OK target .env.local") || !strings.Contains(out.String(), "OK device key") || !strings.Contains(out.String(), "OK repository encryption key") || strings.Contains(out.String(), "runtime-test-sentinel") {
 		t.Fatalf("doctor result = code %d, out %q, err %q", code, out.String(), errOut.String())
 	}
 	if err := os.Chmod(filepath.Join(root, ".env.local"), 0o644); err != nil {
@@ -464,6 +467,8 @@ func TestDoctorTargetSeparatesIgnoreAndModeFailures(t *testing.T) {
 
 func TestImportTightensPermissiveTargetThenDoctorPasses(t *testing.T) {
 	root := t.TempDir()
+	isolateUpdateState(t)
+	stubLatestRelease(t, "v1.1.3")
 	if output, err := exec.Command("git", "init", "-q", root).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, output)
 	}

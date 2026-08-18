@@ -25,6 +25,11 @@ that already declares a local environment contract.
 | GitHub account | Must have write access to the target repository |
 | Local Git checkout | Repository contains `localenv.yaml` and declared schema files |
 | Secure credential storage | OS keychain preferred; optional explicit credential file for headless use |
+| `cosign` | Required only for verified CLI self-update; keep it available on `PATH` if you want to use `localenv version --update` or the interactive update prompt |
+
+The CLI itself can be installed and used without `cosign`. Only the self-update
+path requires it because localenv verifies the signed checksum manifest before
+replacing the executable.
 
 ## Placeholder convention
 
@@ -46,6 +51,12 @@ Ask your operator to confirm:
 
 - `/readyz` returns `ready` on the instance.
 - The target repository is installed on the company GitHub App.
+
+If you plan to use self-update, also verify:
+
+```bash
+cosign version
+```
 
 ## Next step
 

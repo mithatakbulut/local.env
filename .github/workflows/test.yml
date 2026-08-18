@@ -31,6 +31,14 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./cmd/localenv ./cmd/localenv-server
+      - name: Verify release targets cross-compile
+        run: |
+          set -eu
+          for target in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64"; do
+            set -- ${target}
+            CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -o "/tmp/localenv-$1-$2" ./cmd/localenv
+            CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -o "/tmp/localenv-server-$1-$2" ./cmd/localenv-server
+          done
       - run: docker build --file deploy/docker/Dockerfile --tag localenv:test .
       - uses: golang/govulncheck-action@v1
       - uses: aquasecurity/trivy-action@v0.36.0

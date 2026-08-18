@@ -86,6 +86,14 @@ func Run(args []string, out, errOut io.Writer) int {
 		usage(out)
 		return 2
 	}
+	code := dispatch(args, out, errOut)
+	if shouldNotifyUpdate(args[0]) {
+		notifyUpdate(errOut)
+	}
+	return code
+}
+
+func dispatch(args []string, out, errOut io.Writer) int {
 	switch args[0] {
 	case "login":
 		return runLogin(args[1:], out, errOut)
@@ -113,8 +121,15 @@ func Run(args []string, out, errOut io.Writer) int {
 		return runDevices(args[1:], out, errOut)
 	case "keys":
 		return runKeys(args[1:], out, errOut)
-	case "--version", "version":
+	case "--version":
+		if len(args) != 1 {
+			fmt.Fprintln(errOut, "Usage: localenv --version")
+			return 2
+		}
+		fmt.Fprintln(out, Version)
 		return 0
+	case "version":
+		return runVersion(args[1:], out, errOut)
 	case "--help", "help":
 		usage(out)
 		return 0
@@ -141,6 +156,7 @@ func usage(out io.Writer) {
 	fmt.Fprintln(out, "  doctor                Check local.env connectivity and local configuration")
 	fmt.Fprintln(out, "  devices               List, approve, or revoke repository devices")
 	fmt.Fprintln(out, "  keys rotate           Re-encrypt current values with a new repository key")
+	fmt.Fprintln(out, "  version               Show the CLI version and any newer GitHub release")
 }
 
 // runRuntime decrypts the repository snapshot only in this process, adds its
@@ -239,6 +255,7 @@ func runDoctor(args []string, out, errOut io.Writer) int {
 	}
 
 	ok := true
+	doctorCLIVersion(out)
 	secrets, err := credentialStore(*credentialFile)
 	if err != nil {
 		doctorResult(out, "credential storage", false, "unavailable")

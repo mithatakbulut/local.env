@@ -31,12 +31,20 @@ jobs:
       - run: go test ./...
       - name: Build release archives
         run: |
-          mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/localenv ./cmd/localenv
-          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/localenv-server ./cmd/localenv-server
-          tar -C dist -czf dist/localenv_${GITHUB_REF_NAME}_linux_amd64.tar.gz localenv localenv-server
-          rm dist/localenv dist/localenv-server
-          (cd dist && sha256sum localenv_"${GITHUB_REF_NAME}"_linux_amd64.tar.gz > checksums.txt)
+          set -eu
+          mkdir -p dist/build
+          for target in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64"; do
+            set -- ${target}
+            goos="$1"
+            goarch="$2"
+            build_dir="dist/build/${goos}_${goarch}"
+            mkdir -p "${build_dir}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "${build_dir}/localenv" ./cmd/localenv
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "${build_dir}/localenv-server" ./cmd/localenv-server
+            tar -C "${build_dir}" -czf "dist/localenv_${GITHUB_REF_NAME}_${goos}_${goarch}.tar.gz" localenv localenv-server
+          done
+          rm -rf dist/build
+          (cd dist && sha256sum localenv_"${GITHUB_REF_NAME}"_*.tar.gz > checksums.txt)
       - uses: anchore/sbom-action@v0
         with:
           artifact-name: sbom.spdx.json
