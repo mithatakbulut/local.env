@@ -41,8 +41,12 @@ The server never stores:
 ## Local file safety
 
 `localenv sync` writes marker-bounded managed blocks atomically with mode
-`0600` and preserves unrelated content. `localenv run -- …` avoids writing a
-managed plaintext dotenv file entirely.
+`0600` and preserves unrelated content. An existing target that is already up
+to date is still tightened to `0600`. `localenv import FILE` sets the same
+mode on an existing declared target before reading it, without rewriting
+unrelated content. `localenv run -- …` avoids writing a managed plaintext
+dotenv file entirely. `localenv doctor` checks ignore status and mode but does
+not change files.
 
 ## Logging
 

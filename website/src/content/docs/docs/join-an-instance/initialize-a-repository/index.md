@@ -53,8 +53,9 @@ Run read-only diagnostics:
 localenv doctor
 ```
 
-Resolve any reported contract, permission, or target-file warnings before
-syncing values.
+Resolve contract and ignore warnings before syncing. A present target that is
+not mode `0600` fails until `localenv import` or `localenv sync` tightens it.
+`doctor` does not change files.
 
 ## Next step
 
