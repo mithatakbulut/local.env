@@ -134,3 +134,20 @@ select:focus-visible {
   outline: 3px solid var(--gold);
   outline-offset: 4px;
 }
+
+/* Keep Starlight's utility controls separate from the site-title column. */
+.header > .right-group {
+  margin-inline-start: auto;
+}
+
+@media (min-width: 50rem) {
+  .header > .title-wrapper {
+    grid-column: 1;
+  }
+
+  .header > .right-group {
+    grid-column: 3;
+    justify-self: end;
+    margin-inline-start: 0;
+  }
+}
