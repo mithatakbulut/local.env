@@ -1,0 +1,20 @@
+{
+  "name": "localenv",
+  "interface": {
+    "displayName": "local.env"
+  },
+  "plugins": [
+    {
+      "name": "localenv",
+      "source": {
+        "source": "local",
+        "path": "./plugins/localenv"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

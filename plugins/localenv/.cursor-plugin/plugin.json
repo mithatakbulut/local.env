@@ -1,0 +1,16 @@
+{
+  "name": "localenv",
+  "displayName": "local.env",
+  "version": "0.1.0",
+  "description": "Use and administer local.env safely from coding agents",
+  "author": {
+    "name": "Mithat Akbulut"
+  },
+  "homepage": "https://www.local.env.best",
+  "repository": "https://github.com/mithatakbulut/local.env",
+  "license": "Apache-2.0",
+  "keywords": ["localenv", "dotenv", "environment", "secrets", "developer-tools"],
+  "category": "developer-tools",
+  "tags": ["dotenv", "secrets", "environment", "developer-tools"],
+  "skills": "./skills/"
+}

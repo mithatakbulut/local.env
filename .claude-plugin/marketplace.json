@@ -1,0 +1,13 @@
+{
+  "name": "localenv",
+  "owner": {
+    "name": "Mithat Akbulut"
+  },
+  "plugins": [
+    {
+      "name": "localenv",
+      "source": "./plugins/localenv",
+      "description": "Use and administer local.env safely from coding agents"
+    }
+  ]
+}

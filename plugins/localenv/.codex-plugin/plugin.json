@@ -1,0 +1,27 @@
+{
+  "name": "localenv",
+  "version": "0.1.0",
+  "description": "Use and administer local.env safely from coding agents",
+  "author": {
+    "name": "Mithat Akbulut",
+    "url": "https://www.local.env.best"
+  },
+  "homepage": "https://www.local.env.best",
+  "repository": "https://github.com/mithatakbulut/local.env",
+  "license": "Apache-2.0",
+  "keywords": ["localenv", "dotenv", "environment", "secrets", "developer-tools"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "local.env",
+    "shortDescription": "Agent-native local development environment workflows",
+    "longDescription": "Safely use local.env for developer workflows and self-hosted instance administration without exposing managed plaintext secrets.",
+    "developerName": "Mithat Akbulut",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://www.local.env.best",
+    "defaultPrompt": [
+      "Sync my local development environment with local.env.",
+      "Set up a local.env instance for my organization."
+    ]
+  }
+}
