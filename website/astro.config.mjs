@@ -115,6 +115,7 @@ export default defineConfig({
         {
           label: "Use local.env",
           items: [
+            { label: "Coding agents", slug: "docs/use-localenv/coding-agents" },
             { label: "Everyday CLI workflows", slug: "docs/use-localenv/everyday-cli-workflows" },
             { label: "Runtime mode", slug: "docs/use-localenv/runtime-mode" },
             { label: "Device approval and revocation", slug: "docs/use-localenv/device-approval-and-revocation" },

@@ -13,6 +13,7 @@ const docRoutes = [
   "docs/self-host/verify-your-instance/index.html",
   "docs/join-an-instance/prerequisites/index.html",
   "docs/join-an-instance/verify-your-first-sync/index.html",
+  "docs/use-localenv/coding-agents/index.html",
   "docs/use-localenv/everyday-cli-workflows/index.html",
   "docs/operate/backup-restore-and-upgrades/index.html",
   "docs/security/security-model/index.html",
@@ -44,7 +45,7 @@ test("the static header policy is copied to deploy output", () => {
 });
 
 test("generated static HTML has no remote runtime dependency", () => {
-  const pages = ["index.html", "docs/index.html", "docs/overview/index.html", "blog/index.html", "blog/localenv-security-model/index.html", "404.html"];
+  const pages = ["index.html", "docs/index.html", "docs/overview/index.html", "docs/use-localenv/coding-agents/index.html", "blog/index.html", "blog/localenv-security-model/index.html", "404.html"];
   for (const page of pages) {
     const html = readFileSync(output(page), "utf8");
     assert.doesNotMatch(html, /<(?:script|img)\b[^>]+https?:\/\//i, `${page} contains no remote script or image`);
@@ -65,8 +66,10 @@ test("landing page has the required truthful calls to action and local brand ass
     "Apache-2.0 licensed free software",
     "not production, staging, CI, or general-purpose credential storage",
     "display name, logo, and favicon",
-    "Synthetic product previews"
-  ]) assert.match(landing, new RegExp(text));
+    "Synthetic product previews",
+    "Install once. Ask Claude Code, Codex, or Cursor to use local.env.",
+    "Set up your coding agent"
+  ]) assert.match(landing, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(landing, /https:\/\/local\.env\.best\/login/);
   assert.match(landing, /\/images\/local-env-asterisk-192\.png/);
   assert.match(landing, /\/images\/local-env-og\.png/);
@@ -97,6 +100,15 @@ test("documentation uses safe placeholders and excludes sensitive sentinels", ()
   assert.equal(sawPlaceholder, true, "at least one documentation page includes approved placeholder examples");
 });
 
+test("coding-agent docs cover supported hosts and the CLI boundary", () => {
+  const agents = readFileSync(output("docs/use-localenv/coding-agents/index.html"), "utf8");
+  for (const text of ["Claude Code", "Codex", "Cursor", "GitHub repository", "execution boundary", "no MCP server to run", "plain English"]) {
+    assert.match(agents, new RegExp(text, "i"));
+  }
+  assert.match(agents, /mithatakbulut\/local\.env/);
+  assert.match(agents, /localenv@localenv/);
+});
+
 test("documentation uses the landing-page palette and defaults to dark", () => {
   const docs = readFileSync(output("docs/overview/index.html"), "utf8");
   assert.match(docs, /data-theme="dark"/);
@@ -118,6 +130,7 @@ test("landing page journey links point at the documented happy paths", () => {
   const landing = readFileSync(output("index.html"), "utf8");
   assert.match(landing, /\/docs\/self-host\/prerequisites\//);
   assert.match(landing, /\/docs\/join-an-instance\/prerequisites\//);
+  assert.match(landing, /\/docs\/use-localenv\/coding-agents\//);
   assert.match(landing, /\/docs\/security\/security-model\//);
 });
 
