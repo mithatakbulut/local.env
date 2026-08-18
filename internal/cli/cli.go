@@ -285,10 +285,9 @@ func runDoctor(args []string, out, errOut io.Writer) int {
 	} else {
 		doctorResult(out, "localenv.yaml", true, "")
 		for _, file := range contract.Files {
-			if doctorTargetSafe(gitIdentity.Root, file.Target) {
-				doctorResult(out, "target "+file.Target, true, "ignored and safe")
-			} else {
-				doctorResult(out, "target "+file.Target, false, "must be Git-ignored and, when present, mode 0600")
+			targetOK, detail := doctorTarget(gitIdentity.Root, file.Target)
+			doctorResult(out, "target "+file.Target, targetOK, detail)
+			if !targetOK {
 				ok = false
 			}
 		}
@@ -351,17 +350,26 @@ func instanceReachable(instance string) bool {
 	return response.StatusCode >= 200 && response.StatusCode < 300
 }
 
-func doctorTargetSafe(root, target string) bool {
+func doctorTarget(root, target string) (bool, string) {
 	ignored, err := gitIgnored(root, target)
 	if err != nil || !ignored {
-		return false
+		return false, "must be Git-ignored"
 	}
 	path, err := safeLocalTarget(root, target)
 	if err != nil {
-		return false
+		return false, "must not be a symlink and must stay inside the repository"
 	}
 	info, err := os.Stat(path)
-	return errors.Is(err, os.ErrNotExist) || (err == nil && info.Mode().Perm() == 0o600)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, "ignored and safe"
+	}
+	if err != nil {
+		return false, "could not inspect"
+	}
+	if info.Mode().Perm() != 0o600 {
+		return false, "must be mode 0600; run localenv import or localenv sync"
+	}
+	return true, "ignored and safe"
 }
 
 func runSync(args []string, out, errOut io.Writer) int {
@@ -541,8 +549,12 @@ func applySnapshot(root string, remote decryptedSnapshot, dryRun bool, out, errO
 		}
 		if !change.Changed {
 			if !dryRun && targetExists {
-				if err := os.Chmod(path, 0o600); err != nil {
+				tightened, err := ensureLocalTargetMode0600(root, target)
+				if err != nil {
 					return err
+				}
+				if tightened {
+					fmt.Fprintf(out, "%s: set mode 0600\n", target)
 				}
 			}
 			fmt.Fprintf(out, "%s: already up to date\n", target)
@@ -609,6 +621,27 @@ func safeLocalTarget(root, target string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func ensureLocalTargetMode0600(root, target string) (bool, error) {
+	path, err := safeLocalTarget(root, target)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode().Perm() == 0o600 {
+		return false, nil
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func withinRoot(root, candidate string) bool {
@@ -762,6 +795,11 @@ func runImport(args []string, out, errOut io.Writer) int {
 		fmt.Fprintln(errOut, "localenv: import file is not a declared localenv.yaml target")
 		return 1
 	}
+	tightened, err := ensureLocalTargetMode0600(gitIdentity.Root, schema.Target)
+	if err != nil {
+		fmt.Fprintln(errOut, "localenv: could not set safe permissions on the local dotenv file")
+		return 1
+	}
 	values, err := dotenvValues(filepath.Join(gitIdentity.Root, schema.Target))
 	if err != nil {
 		fmt.Fprintln(errOut, "localenv: could not parse the local dotenv file")
@@ -813,6 +851,9 @@ func runImport(args []string, out, errOut io.Writer) int {
 		count++
 	}
 	fmt.Fprintf(out, "Encrypted and imported %d declared local value(s).\n", count)
+	if tightened {
+		fmt.Fprintf(out, "Set %s to mode 0600.\n", schema.Target)
+	}
 	return 0
 }
 
