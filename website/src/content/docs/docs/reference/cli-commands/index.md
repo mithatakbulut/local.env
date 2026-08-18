@@ -11,6 +11,13 @@ description: Reference for common localenv CLI commands.
 | `localenv logout` | Revokes remote session |
 | `localenv status` | Shows non-secret user, repository, and device metadata |
 | `localenv doctor` | Read-only diagnostics; a present target must be Git-ignored and mode `0600` |
+| `localenv --version` | Print the CLI build version only |
+| `localenv version` | Print the CLI version and whether a newer GitHub release is available |
+
+Interactive commands also print a short stderr notice when a newer GitHub
+release exists. The check is cached for 24 hours and skipped for
+`localenv --version`, non-TTY output, `CI`, and
+`LOCALENV_NO_UPDATE_NOTIFIER`.
 
 ## Repository bootstrap
 

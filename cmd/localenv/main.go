@@ -2,7 +2,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"os"
 
@@ -11,14 +10,11 @@ import (
 
 var version = "dev"
 
-func run(args []string, out io.Writer) int {
-	if len(args) == 1 && args[0] == "--version" {
-		fmt.Fprintln(out, version)
-		return 0
-	}
-	return cli.Run(args, out, out)
+func run(args []string, out, errOut io.Writer) int {
+	cli.Version = version
+	return cli.Run(args, out, errOut)
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout))
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
