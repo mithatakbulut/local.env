@@ -125,7 +125,7 @@ test("published blog posts and RSS exclude drafts", () => {
   const draftIdentifier = "w1-foundation-draft";
   const published = [
     "blog/public-docs-and-metadata-only-dashboard/index.html",
-    "blog/for-the-curious-algorithms-and-cryptography/index.html",
+    "blog/localenv-why-env-sharing-is-awkward/index.html",
     "blog/localenv-security-model/index.html"
   ];
   for (const path of published) {
@@ -138,9 +138,9 @@ test("published blog posts and RSS exclude drafts", () => {
   }
   assert.equal(existsSync(output(`blog/${draftIdentifier}/index.html`)), false);
   assert.match(index, /The dashboard is supposed to be a little boring/);
-  assert.match(index, /For the curious: how algorithms and cryptography do different jobs/);
+  assert.match(index, /Why sharing local env values is still awkward/);
   assert.match(index, /How are secrets protected before they ever reach the server/);
-  assert.match(rss, /\/blog\/for-the-curious-algorithms-and-cryptography\//);
+  assert.match(rss, /\/blog\/localenv-why-env-sharing-is-awkward\//);
   assert.match(rss, /\/blog\/localenv-security-model\//);
   assert.doesNotMatch(rss, new RegExp(draftIdentifier));
   assert.doesNotMatch(index, /No active advisory/);
@@ -156,10 +156,10 @@ test("published blog posts and RSS exclude drafts", () => {
   assert.equal(existsSync(output("blog/category/security-advisory/index.html")), false);
   assert.equal(existsSync(output("blog/category/product-update/index.html")), false);
   assert.match(readFileSync(output("docs/security/security-advisories/index.html"), "utf8"), /Our publication process/);
-  const curiousPost = readFileSync(output("blog/for-the-curious-algorithms-and-cryptography/index.html"), "utf8");
-  assert.match(curiousPost, /XChaCha20-Poly1305/);
-  assert.match(curiousPost, /age X25519/);
-  assert.match(curiousPost, /not production, staging, CI, or\s+general-purpose credential storage/);
+  const sharingPost = readFileSync(output("blog/localenv-why-env-sharing-is-awkward/index.html"), "utf8");
+  assert.match(sharingPost, /Slack/);
+  assert.match(sharingPost, /localenv sync/);
+  assert.match(sharingPost, /localenv run -- npm run dev/);
   const securityPost = readFileSync(output("blog/localenv-security-model/index.html"), "utf8");
   assert.equal([...securityPost.matchAll(/<figure class="diagram">/g)].length, 8);
   assert.equal([...securityPost.matchAll(/<svg\b[^>]*\bid="mermaid-/g)].length, 8);
