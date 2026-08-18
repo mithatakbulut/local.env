@@ -1019,7 +1019,7 @@ func runSet(args []string, out, errOut io.Writer) int {
 				value, err = io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
 				value = bytes.TrimSuffix(value, []byte("\n"))
 			} else {
-				value, err = hiddenValue(out)
+				value, err = hiddenValue(out, requirement.KeyName, requirement.FilePath)
 			}
 			if err != nil {
 				fmt.Fprintln(errOut, "localenv: could not read a secret value")
@@ -1042,8 +1042,8 @@ func runSet(args []string, out, errOut io.Writer) int {
 	return 1
 }
 
-func hiddenValue(out io.Writer) ([]byte, error) {
-	fmt.Fprint(out, styled(out, ansiCyan, "Value:")+" ")
+func hiddenValue(out io.Writer, keyName, filePath string) ([]byte, error) {
+	fmt.Fprint(out, styled(out, ansiCyan, secretPromptLabel(keyName, filePath))+" ")
 	state, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return nil, err
@@ -1058,6 +1058,19 @@ func hiddenValue(out io.Writer) ([]byte, error) {
 		return nil, restoreErr
 	}
 	return value, nil
+}
+
+func secretPromptLabel(keyName, filePath string) string {
+	keyName = strings.TrimSpace(keyName)
+	filePath = strings.TrimSpace(filePath)
+	switch {
+	case keyName != "" && filePath != "":
+		return filePath + " " + keyName + "="
+	case keyName != "":
+		return keyName + "="
+	default:
+		return "Value="
+	}
 }
 
 // maskedValue accepts a terminal value without echoing its contents while
@@ -1102,7 +1115,7 @@ func setEncryptedPRValue(out, errOut io.Writer, instance, token, owner, name str
 	value := supplied
 	if value == nil {
 		var err error
-		value, err = hiddenValue(out)
+		value, err = hiddenValue(out, requirement.KeyName, requirement.FilePath)
 		if err != nil {
 			fmt.Fprintln(errOut, "localenv: could not read a secret value")
 			return false, false

@@ -25,8 +25,9 @@ pull request.
 localenv resolve --pr NUMBER
 ```
 
-Replace `NUMBER` with the pull request number. The CLI prompts for a value,
-masks terminal echo, encrypts locally, and uploads ciphertext only.
+Replace `NUMBER` with the pull request number. For each missing key the CLI
+prompts with the target file and key name (`target KEY=`), masks terminal
+echo, encrypts locally, and uploads ciphertext only.
 
 Alternatively set a single PR-scoped key:
 
