@@ -41,7 +41,8 @@ localenv diff
 ## Expected result
 
 - Unrelated variables outside the managed block remain unchanged.
-- The target file is written atomically with Unix mode `0600`.
+- The target file is written atomically with Unix mode `0600`. An already
+  up-to-date existing target is still tightened to `0600`.
 - If the target is not ignored by Git, the CLI warns you.
 
 ## Verify
