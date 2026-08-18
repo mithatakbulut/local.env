@@ -17,16 +17,20 @@ description: Reference for common localenv CLI commands.
 
 Interactive commands check for a newer GitHub release at most once every 24
 hours. When an update is available, an interactive terminal can offer
-`Update now? [y/N]`; declining suppresses the notice for 24 hours. Checks are
-skipped for `localenv --version`, non-TTY output, `CI`, and
-`LOCALENV_NO_UPDATE_NOTIFIER`.
+`Update now? [y/N]`; declining suppresses that release notice for 24 hours.
+Checks and prompts are skipped for `localenv --version`, non-TTY output, `CI`,
+and `LOCALENV_NO_UPDATE_NOTIFIER`.
 
 Self-update supports Linux and macOS on amd64 and arm64. Before replacing the
 current CLI, localenv verifies the Sigstore signature on `checksums.txt` against
-the repository's GitHub Actions release workflow identity, then verifies the
-selected archive's SHA-256 checksum. Automatic updates require a recent
-`cosign` binary on `PATH`; if verification cannot be completed, the installed
+the exact GitHub Actions release workflow identity, then verifies the selected
+archive's SHA-256 checksum. Automatic updates require `cosign` on `PATH` and
+write permission to the directory containing the current executable. If any
+verification, download, extraction, or replacement step fails, the installed
 CLI is left unchanged.
+
+For installation guidance, including user-writable paths that work well with
+self-update, see [Install the CLI](../../join-an-instance/install-the-cli/).
 
 ## Repository bootstrap
 
