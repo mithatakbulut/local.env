@@ -19,6 +19,12 @@ description: Non-secret server configuration variables for local.env.
 | `LOCALENV_LOGO_URL` | unset | Optional HTTPS dashboard logo |
 | `LOCALENV_FAVICON_URL` | unset | Optional HTTPS dashboard favicon |
 
+## CLI settings
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LOCALENV_NO_UPDATE_NOTIFIER` | unset | Disable interactive CLI update checks and prompts when set to any non-empty value |
+
 ## Bootstrap setup secrets
 
 Set outside `/data` before first `/setup`:

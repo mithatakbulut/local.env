@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -44,16 +47,13 @@ func TestVersionCommandReportsUpdateWhenBehind(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	latestReleaseAPI = server.URL + "/releases/latest"
-	t.Cleanup(func() {
-		latestReleaseAPI = "https://api.github.com/repos/" + githubReleasesRepo + "/releases/latest"
-	})
 
 	var out, errOut bytes.Buffer
 	if code := Run([]string{"version"}, &out, &errOut); code != 0 || errOut.Len() != 0 {
 		t.Fatalf("version exit %d err=%q", code, errOut.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "v1.1.0") || !strings.Contains(got, "Update available:") || !strings.Contains(got, "v1.1.3") || !strings.Contains(got, "https://github.com/mithatakbulut/local.env/releases/tag/v1.1.3") {
+	if !strings.Contains(got, "v1.1.0") || !strings.Contains(got, "Update available:") || !strings.Contains(got, "v1.1.3") || !strings.Contains(got, "https://github.com/mithatakbulut/local.env/releases/tag/v1.1.3") || !strings.Contains(got, "localenv version --update") {
 		t.Fatalf("version output = %q", got)
 	}
 }
@@ -75,9 +75,6 @@ func TestVersionCommandStaysCurrentWithoutFailingLookup(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	latestReleaseAPI = server.URL
-	t.Cleanup(func() {
-		latestReleaseAPI = "https://api.github.com/repos/" + githubReleasesRepo + "/releases/latest"
-	})
 
 	var out, errOut bytes.Buffer
 	if code := Run([]string{"version"}, &out, &errOut); code != 0 || errOut.Len() != 0 {
@@ -118,7 +115,7 @@ func TestHelpPrintsUpdateNoticeWhenBehind(t *testing.T) {
 		t.Fatalf("notice leaked to stdout: %q", out.String())
 	}
 	got := errOut.String()
-	if !strings.Contains(got, "Update available:") || !strings.Contains(got, "v1.1.0 → v1.1.3") || !strings.Contains(got, "https://github.com/"+githubReleasesRepo+"/releases/tag/v1.1.3") {
+	if !strings.Contains(got, "Update available:") || !strings.Contains(got, "v1.1.0 → v1.1.3") || !strings.Contains(got, "https://github.com/"+githubReleasesRepo+"/releases/tag/v1.1.3") || !strings.Contains(got, "localenv version --update") {
 		t.Fatalf("update notice = %q", got)
 	}
 }
@@ -135,7 +132,7 @@ func TestVersionFlagDoesNotPrintUpdateNotice(t *testing.T) {
 	}
 }
 
-func TestUpdateNoticeUsesCachedReleaseWithoutRefetching(t *testing.T) {
+func TestUpdateNoticeUsesCachedReleaseWithoutRefetchingAndDoesNotRepeat(t *testing.T) {
 	isolateUpdateState(t)
 	updateNoticeTTYOnly = false
 	Version = "v1.1.0"
@@ -145,9 +142,7 @@ func TestUpdateNoticeUsesCachedReleaseWithoutRefetching(t *testing.T) {
 		_, _ = w.Write([]byte(`{"tag_name":"v1.1.3","html_url":"https://github.com/` + githubReleasesRepo + `/releases/tag/v1.1.3"}`))
 	}))
 	t.Cleanup(server.Close)
-	original := latestReleaseAPI
 	latestReleaseAPI = server.URL
-	t.Cleanup(func() { latestReleaseAPI = original })
 
 	var first, second bytes.Buffer
 	notifyUpdate(&first)
@@ -155,8 +150,23 @@ func TestUpdateNoticeUsesCachedReleaseWithoutRefetching(t *testing.T) {
 	if hits != 1 {
 		t.Fatalf("lookups = %d, want 1", hits)
 	}
-	if !strings.Contains(first.String(), "v1.1.0 → v1.1.3") || !strings.Contains(second.String(), "v1.1.0 → v1.1.3") {
+	if !strings.Contains(first.String(), "v1.1.0 → v1.1.3") || second.Len() != 0 {
 		t.Fatalf("first=%q second=%q", first.String(), second.String())
+	}
+}
+
+func TestUpdateNoticePromptsOnInteractiveInput(t *testing.T) {
+	isolateUpdateState(t)
+	updateNoticeTTYOnly = false
+	updatePromptTTYOnly = false
+	updatePromptInput = strings.NewReader("n\n")
+	Version = "v1.1.0"
+	stubLatestRelease(t, "v1.1.3")
+
+	var out bytes.Buffer
+	notifyUpdate(&out)
+	if !strings.Contains(out.String(), "Update now? [y/N]") {
+		t.Fatalf("notice=%q", out.String())
 	}
 }
 
@@ -170,9 +180,7 @@ func TestUpdateNoticeBacksOffAfterFailedLookup(t *testing.T) {
 		http.Error(w, "unavailable", http.StatusBadGateway)
 	}))
 	t.Cleanup(server.Close)
-	original := latestReleaseAPI
 	latestReleaseAPI = server.URL
-	t.Cleanup(func() { latestReleaseAPI = original })
 
 	var first, second bytes.Buffer
 	notifyUpdate(&first)
@@ -223,15 +231,41 @@ func isolateUpdateState(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("LOCALENV_NO_UPDATE_NOTIFIER", "")
 	originalPath := updateStatePath
-	originalTTY := updateNoticeTTYOnly
+	originalNoticeTTY := updateNoticeTTYOnly
 	originalVersion := Version
 	originalFailureRetryInterval := updateFailureRetryInterval
+	originalLatestReleaseAPI := latestReleaseAPI
+	originalPromptInput := updatePromptInput
+	originalPromptTTY := updatePromptTTYOnly
+	originalExecutablePath := updateExecutablePath
+	originalLookPath := updateLookPath
+	originalGOOS := updateGOOS
+	originalGOARCH := updateGOARCH
+	originalAllowHTTP := updateAllowHTTP
+	originalHTTPClient := updateHTTPClient
 	updateStatePath = filepath.Join(t.TempDir(), "update-check.json")
+	updatePromptInput = os.Stdin
+	updatePromptTTYOnly = true
+	updateExecutablePath = os.Executable
+	updateLookPath = exec.LookPath
+	updateGOOS = runtime.GOOS
+	updateGOARCH = runtime.GOARCH
+	updateAllowHTTP = false
+	updateHTTPClient = &http.Client{Timeout: 60 * time.Second}
 	t.Cleanup(func() {
 		updateStatePath = originalPath
-		updateNoticeTTYOnly = originalTTY
+		updateNoticeTTYOnly = originalNoticeTTY
 		Version = originalVersion
 		updateFailureRetryInterval = originalFailureRetryInterval
+		latestReleaseAPI = originalLatestReleaseAPI
+		updatePromptInput = originalPromptInput
+		updatePromptTTYOnly = originalPromptTTY
+		updateExecutablePath = originalExecutablePath
+		updateLookPath = originalLookPath
+		updateGOOS = originalGOOS
+		updateGOARCH = originalGOARCH
+		updateAllowHTTP = originalAllowHTTP
+		updateHTTPClient = originalHTTPClient
 	})
 }
 
@@ -241,7 +275,5 @@ func stubLatestRelease(t *testing.T, tag string) {
 		_, _ = w.Write([]byte(`{"tag_name":"` + tag + `","html_url":"https://github.com/` + githubReleasesRepo + `/releases/tag/` + tag + `"}`))
 	}))
 	t.Cleanup(server.Close)
-	original := latestReleaseAPI
 	latestReleaseAPI = server.URL
-	t.Cleanup(func() { latestReleaseAPI = original })
 }

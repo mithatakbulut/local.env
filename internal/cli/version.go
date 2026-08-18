@@ -25,13 +25,13 @@ const (
 var Version = "dev"
 
 var (
-	latestReleaseAPI          = "https://api.github.com/repos/" + githubReleasesRepo + "/releases/latest"
-	updateCheckInterval       = 24 * time.Hour
+	latestReleaseAPI           = "https://api.github.com/repos/" + githubReleasesRepo + "/releases/latest"
+	updateCheckInterval        = 24 * time.Hour
 	updateFailureRetryInterval = time.Hour
-	updateStatePath           string
-	updateNoticeTTYOnly       = true
-	opportunisticLookupFor    = 2 * time.Second
-	explicitLookupFor         = 5 * time.Second
+	updateStatePath            string
+	updateNoticeTTYOnly        = true
+	opportunisticLookupFor     = 2 * time.Second
+	explicitLookupFor          = 5 * time.Second
 )
 
 type releaseStatus int
@@ -43,21 +43,31 @@ const (
 	releaseAhead
 )
 
+type githubReleaseAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
 type githubRelease struct {
-	TagName string `json:"tag_name"`
-	HTMLURL string `json:"html_url"`
+	TagName string               `json:"tag_name"`
+	HTMLURL string               `json:"html_url"`
+	Assets  []githubReleaseAsset `json:"assets"`
 }
 
 type updateState struct {
-	CheckedAt string `json:"checked_at,omitempty"`
-	FailedAt  string `json:"failed_at,omitempty"`
-	TagName   string `json:"tag_name,omitempty"`
-	HTMLURL   string `json:"html_url,omitempty"`
+	CheckedAt  string `json:"checked_at,omitempty"`
+	FailedAt   string `json:"failed_at,omitempty"`
+	NotifiedAt string `json:"notified_at,omitempty"`
+	TagName    string `json:"tag_name,omitempty"`
+	HTMLURL    string `json:"html_url,omitempty"`
 }
 
 func runVersion(args []string, out, errOut io.Writer) int {
+	if len(args) == 1 && args[0] == "--update" {
+		return runSelfUpdate(out, errOut)
+	}
 	if len(args) != 0 {
-		fmt.Fprintln(errOut, "Usage: localenv version")
+		fmt.Fprintln(errOut, "Usage: localenv version [--update]")
 		return 2
 	}
 	fmt.Fprintln(out, Version)
@@ -73,6 +83,7 @@ func runVersion(args []string, out, errOut io.Writer) int {
 	case releaseBehind:
 		fmt.Fprintf(out, "%s %s\n", styled(out, ansiYellow, "Update available:"), release.TagName)
 		fmt.Fprintln(out, releasePage(release))
+		fmt.Fprintln(out, "Run `localenv version --update` to install.")
 	case releaseCurrent:
 		fmt.Fprintln(out, "Up to date")
 	case releaseAhead:
@@ -114,13 +125,18 @@ func notifyUpdate(errOut io.Writer) {
 		return
 	}
 	release, ok := cachedOrLookupLatest()
-	if !ok || compareRelease(Version, release.TagName) != releaseBehind {
+	if !ok || compareRelease(Version, release.TagName) != releaseBehind || updateNoticeRecentlyShown(release.TagName) {
 		return
 	}
 	raw := unwrapWriter(errOut)
 	fmt.Fprintln(raw)
 	fmt.Fprintf(raw, "%s %s → %s\n", styled(errOut, ansiYellow, "Update available:"), Version, release.TagName)
 	fmt.Fprintln(raw, releasePage(release))
+	_ = markUpdateNotified(release)
+	if err := promptAndMaybeInstallUpdate(release, raw); err != nil {
+		fmt.Fprintf(raw, "Update failed: %v\n", err)
+		fmt.Fprintln(raw, "Run `localenv version --update` to retry.")
+	}
 }
 
 func cachedOrLookupLatest() (githubRelease, bool) {
@@ -190,9 +206,10 @@ func releasePage(release githubRelease) string {
 }
 
 type parsedUpdateState struct {
-	checkedAt time.Time
-	failedAt  time.Time
-	release   githubRelease
+	checkedAt  time.Time
+	failedAt   time.Time
+	notifiedAt time.Time
+	release    githubRelease
 }
 
 func readUpdateState() (parsedUpdateState, bool) {
@@ -209,12 +226,17 @@ func readUpdateState() (parsedUpdateState, bool) {
 		return parsedUpdateState{}, false
 	}
 	failedAt, ok := parseOptionalUpdateTime(state.FailedAt)
-	if !ok || checkedAt.IsZero() && failedAt.IsZero() {
+	if !ok {
+		return parsedUpdateState{}, false
+	}
+	notifiedAt, ok := parseOptionalUpdateTime(state.NotifiedAt)
+	if !ok || checkedAt.IsZero() && failedAt.IsZero() && notifiedAt.IsZero() {
 		return parsedUpdateState{}, false
 	}
 	return parsedUpdateState{
-		checkedAt: checkedAt,
-		failedAt:  failedAt,
+		checkedAt:  checkedAt,
+		failedAt:   failedAt,
+		notifiedAt: notifiedAt,
 		release: githubRelease{
 			TagName: strings.TrimSpace(state.TagName),
 			HTMLURL: strings.TrimSpace(state.HTMLURL),
@@ -232,11 +254,15 @@ func parseOptionalUpdateTime(value string) (time.Time, bool) {
 }
 
 func writeUpdateState(release githubRelease) error {
-	return writeUpdateStateFile(updateState{
+	state := updateState{
 		CheckedAt: time.Now().UTC().Format(time.RFC3339),
 		TagName:   release.TagName,
 		HTMLURL:   release.HTMLURL,
-	})
+	}
+	if previous, ok := readUpdateState(); ok && previous.release.TagName == release.TagName && !previous.notifiedAt.IsZero() {
+		state.NotifiedAt = previous.notifiedAt.UTC().Format(time.RFC3339)
+	}
+	return writeUpdateStateFile(state)
 }
 
 func writeUpdateFailure(previous parsedUpdateState) error {
@@ -247,6 +273,32 @@ func writeUpdateFailure(previous parsedUpdateState) error {
 	}
 	if !previous.checkedAt.IsZero() {
 		state.CheckedAt = previous.checkedAt.UTC().Format(time.RFC3339)
+	}
+	if !previous.notifiedAt.IsZero() {
+		state.NotifiedAt = previous.notifiedAt.UTC().Format(time.RFC3339)
+	}
+	return writeUpdateStateFile(state)
+}
+
+func updateNoticeRecentlyShown(tag string) bool {
+	state, ok := readUpdateState()
+	return ok && state.release.TagName == tag && updateTimeIsFresh(state.notifiedAt, updateCheckInterval)
+}
+
+func markUpdateNotified(release githubRelease) error {
+	previous, _ := readUpdateState()
+	state := updateState{
+		NotifiedAt: time.Now().UTC().Format(time.RFC3339),
+		TagName:    release.TagName,
+		HTMLURL:    release.HTMLURL,
+	}
+	if previous.release.TagName == release.TagName {
+		if !previous.checkedAt.IsZero() {
+			state.CheckedAt = previous.checkedAt.UTC().Format(time.RFC3339)
+		}
+		if !previous.failedAt.IsZero() {
+			state.FailedAt = previous.failedAt.UTC().Format(time.RFC3339)
+		}
 	}
 	return writeUpdateStateFile(state)
 }
