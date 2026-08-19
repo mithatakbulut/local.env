@@ -1,8 +1,23 @@
 .git
 .github
 .DS_Store
+
+# Local state and credential material must never enter the build context.
 data
+/data
 *.db
 *.db-shm
 *.db-wal
+.env
+.env.*
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+
 frontend/node_modules
+website/node_modules
+website/.astro
+website/.wrangler
+website/dist
