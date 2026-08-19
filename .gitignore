@@ -1,15 +1,24 @@
+# Local environment and credential material
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+
 /data/
 *.db
 *.db-shm
 *.db-wal
-*.pem
 docs/
 !docs/
 docs/*
 !docs/cli.md
-!docs/dashboard-ui-plan.md
 !docs/installation.md
-!docs/public-website-plan.md
+!docs/public-launch-checklist.md
 !docs/security-model.md
 frontend/node_modules/
 website/node_modules/
